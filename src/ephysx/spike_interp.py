@@ -17,6 +17,7 @@ from scipy.interpolate import PchipInterpolator
 from sklearn.gaussian_process.kernels import RBF
 from scipy.spatial import KDTree
 import threading
+import joblib
 
 tqdm_kw = dict(smoothing=0, mininterval=1 / 24)
 
@@ -580,11 +581,14 @@ class InterpUnit(torch.nn.Module):
             wf_l2 = waveforms.square().sum(dim=(1, 2))
         if "1-r^2" in kinds:
             badnesses["1-r^2"] = l2 / wf_l2
-        if "1-scaledr^2" in kinds:
+        if "scaledl2" or "1-scaledr^2" in kinds:
             scalings = self.get_scalings(waveforms, recons, already_masked=True)
             scaled_l2 = (
                 waveforms.sub(scalings[:, None, None] * recons).square().sum(dim=(1, 2))
             )
+        if "scaledl2" in kinds:
+            badnesses["scaledl2"] = scaled_l2
+        if "1-scaledr^2" in kinds:
             badnesses["1-scaledr^2"] = scaled_l2 / wf_l2
         if "1-maxr^2" in kinds:
             maxsq = torch.amax(waveforms.sub(recons).square(), dim=(1, 2))
@@ -687,6 +691,7 @@ class InterpUnit(torch.nn.Module):
         waveform_channel_index=None,
         show_progress=False,
         with_var=True,
+        weights=None,
     ):
         # transfer waveform -> unit channels, filling with nans
         self.train()
@@ -712,31 +717,34 @@ class InterpUnit(torch.nn.Module):
                 **self.fa_fit_kwargs,
             )
             assert not with_var
+            assert weights is None
         else:
+            if weights is None:
+                weights = torch.ones(n).to(waveforms)
+            weights = weights / weights.sum()
+            mean = torch.nansum(weights[:, None] * waveforms_rel.reshape(n, -1), dim=0)
+            mean = torch.nan_to_num(mean)
+
             self.register_buffer(
-                "mean",
-                torch.nan_to_num(torch.nanmedian(waveforms_rel.reshape(n, -1), dim=0).values),
+                "mean", mean
+                # torch.nan_to_num(torch.nanmedian(waveforms_rel.reshape(n, -1), dim=0).values),
                 # torch.nan_to_num(torch.nanmean(waveforms_rel.reshape(n, -1), dim=0)),
             )
             if with_var:
-                var = torch.nan_to_num(
-                    torch.nanmean(
-                        (waveforms_rel.reshape(n, -1) - self.mean).square(),
-                        dim=0,
-                    ),
-                    nan=1.0,
-                )
+                dxsq = (waveforms_rel.reshape(n, -1) - self.mean).square_()
+                var = torch.nansum(weights[:, None] * dxsq, dim=0)
+                var = torch.nan_to_num(var, nan=1.0)
                 nobs = torch.isfinite(waveforms_rel).sum(0).view(-1).to(var)
                 lambd = nobs / (nobs + self.var_prior_count)
                 var = var * lambd + 1.0 * (1 - lambd)
                 std = var.sqrt()
-                
+
                 # soft version of min
                 norm_mean = torch.norm(self.mean)
                 cov = std / norm_mean
                 cov = cov.clamp(max=self.var_cov_max)
                 var = torch.square(cov * norm_mean)
-                
+
                 # var = 1.0 + F.softplus(var - 1.0)
                 self.register_buffer("var", var)
 
@@ -1051,6 +1059,7 @@ class InterpClusterer(torch.nn.Module):
                 f"Removed {n_removed} too-small units ({pct_removed:0.1f}% of spikes)."
             )
         self.update_labels(old_labels[big_enough], flat=False)
+        return old_labels[big_enough]
 
     def order_by_depth(self):
         """Reorder labels by unit CoM depth."""
@@ -1075,6 +1084,9 @@ class InterpClusterer(torch.nn.Module):
         store=True,
         n_threads=0,
         with_var=True,
+        weights_kind=None,
+        weights_sparse=None,
+        divergences=None,
     ):
         """Fit all models that need fitting."""
         if to_fit is None:
@@ -1088,69 +1100,72 @@ class InterpClusterer(torch.nn.Module):
 
         if show_progress:
             to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
+        
+        if weights_kind is not None and weights_sparse is None:
+            weights_sparse = self.reassignment_weights(
+                unit_ids=to_fit,
+                show_progress=False,
+                n_threads=n_threads,
+                kind=weights_kind,
+                divergences=divergences,
+            )
 
-        if not n_threads:
-            fit_units = []
-            for uid in to_fit:
-                if uid not in self:
-                    model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
-                    model.to(self.device)
-                    if store:
-                        self[uid] = model
-                else:
-                    model = self[uid]
-                fit_units.append(model)
+        def fit_unit(j, uid):
+            if uid not in self:
+                model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
+                model.to(self.device)
+                if store:
+                    self[uid] = model
+            else:
+                model = self[uid]
 
+            in_unit, train_data = self.get_training_data(
+                uid, waveform_kind="original", sampling_method=self.sampling_method
+            )
+
+            weights = None
+            if weights_sparse is not None:
+                weights = torch.index_select(
+                    weights_sparse[j],
+                    0,
+                    in_unit.to(weights_sparse.device),
+                ).to_dense().to(train_data['waveforms'])
+            # elif weights_kind is not None:
+            #     badness = self.reassignment_divergences(
+            #         which_spikes=in_unit,
+            #         units=[model],
+            #         show_progress=False,
+            #         kind=weights_kind,
+            #     )
+            #     weights = np.full(in_unit.shape, np.inf)
+            #     weights[badness.coords[1]] = badness.data
+            #     # weights = torch.from_numpy(np.reciprocal(weights)).to(train_data['waveforms'])
+            #     weights = torch.from_numpy(weights).to(train_data['waveforms'])
+            #     weights = F.softmax(-0.5 * weights, dim=0)
+
+            model.fit_center(**train_data, weights=weights, show_progress=False, with_var=with_var)
+            model.fit_indices = None
+            if fit_residual:
                 in_unit, train_data = self.get_training_data(
-                    uid, waveform_kind="original", sampling_method=self.sampling_method
+                    uid,
+                    waveform_kind=self.split_waveform_kind,
+                    sampling_method=self.split_sampling_method,
                 )
-                model.fit_center(**train_data, show_progress=False, with_var=with_var)
-                model.fit_indices = None
-                if fit_residual:
-                    in_unit, train_data = self.get_training_data(
-                        uid,
-                        waveform_kind=self.split_waveform_kind,
-                        sampling_method=self.split_sampling_method,
-                    )
-                    if self.channel_strategy != "snr":
-                        del train_data["cluster_channel_index"]
-                    model.fit_residual(**train_data, show_progress=False)
-                    model.fit_indices = in_unit
-        else:
-            import joblib
+                if self.channel_strategy != "snr":
+                    del train_data["cluster_channel_index"]
+                model.fit_residual(**train_data, show_progress=False)
+                model.fit_indices = in_unit
+            return model
 
-            fit_units = []
-
-            def fit_unit(uid):
-                if uid not in self:
-                    model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
-                    model.to(self.device)
-                    if store:
-                        self[uid] = model
-                else:
-                    model = self[uid]
-
-                in_unit, train_data = self.get_training_data(
-                    uid, waveform_kind="original", sampling_method=self.sampling_method
-                )
-                model.fit_center(**train_data, show_progress=False, with_var=with_var)
-                model.fit_indices = None
-                if fit_residual:
-                    in_unit, train_data = self.get_training_data(
-                        uid,
-                        waveform_kind=self.split_waveform_kind,
-                        sampling_method=self.split_sampling_method,
-                    )
-                    if self.channel_strategy != "snr":
-                        del train_data["cluster_channel_index"]
-                    model.fit_residual(**train_data, show_progress=False)
-                    model.fit_indices = in_unit
-                return model
-
+        fit_units = []
+        if n_threads:
             for model in joblib.Parallel(n_jobs=n_threads, backend="threading")(
-                joblib.delayed(fit_unit)(uu) for uu in to_fit
+                joblib.delayed(fit_unit)(j, uu) for j, uu in enumerate(to_fit)
             ):
                 fit_units.append(model)
+        else:
+            for j, uu in enumerate(to_fit):
+                fit_units.append(fit_unit(j, uu))
 
         return fit_units
 
@@ -1395,36 +1410,45 @@ class InterpClusterer(torch.nn.Module):
             assignments[closer] = j
             dists[closer] = newdists[closer]
 
-        # replace e with a buffer that is scattered into
-        for i in range(n_iter):
-            # update centroids
-            e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
-            centroids = (e / e.sum(0)).T @ waveforms
+        e = None
+        if n_iter:
+            # e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
+            # centroids = (e / e.sum(0)).T @ waveforms
+            centroids = waveforms[centroid_ixs]
             dists = waveforms[:, None, :] - centroids[None, :, :]
             dists = dists.square_().sum(2)
-            assignments = torch.argmin(dists, 1)
+            for i in range(n_iter):
+                # update centroids
+                e = F.softmax(-0.5 * dists, dim=1)
+                centroids = (e / e.sum(0)).T @ waveforms
+                dists = waveforms[:, None, :] - centroids[None, :, :]
+                dists = dists.square_().sum(2)
+                assignments = torch.argmin(dists, 1)
 
-        return in_unit, assignments.to(in_unit)
+        return in_unit, assignments.to(in_unit), e
 
-    def constrain_split_centroids(self, in_unit, sub_labels):
+    def constrain_split_centroids(self, in_unit, sub_labels, weights=None):
         ids = torch.unique(sub_labels)
         ids = ids[ids >= 0]
         new_units = []
 
         # fit sub-units
-        for label in ids:
+        for j, label in enumerate(ids):
             u = InterpUnit(
                 do_interp=False,
                 **self.unit_kw,
             )
             inu = in_unit[sub_labels == label]
+            w = None
+            if weights is not None:
+                w = weights[sub_labels == label, j]
             inu, train_data = self.get_training_data(
                 unit_id=None,
                 waveform_kind="original",
                 in_unit=inu,
                 sampling_method=self.sampling_method,
             )
-            u.fit_center(**train_data, show_progress=False)
+            u.fit_center(**train_data, show_progress=False, weights=w)
             new_units.append(u)
 
         # remove dead units
@@ -1471,19 +1495,22 @@ class InterpClusterer(torch.nn.Module):
         )
         return labels
 
-    def kmeans_split(self):
+    def kmeans_split(self, verbose=False):
         n_new = 0
         for unit_id in tqdm(self.unit_ids(), desc="kmeans split"):
-            n_new_unit, _ = self.kmeans_split_unit(unit_id)
+            n_new_unit, newids = self.kmeans_split_unit(unit_id)
+            if verbose:
+                print(f"{unit_id=} {newids=}")
             n_new += n_new_unit
         print(f"kmeans split broke off {n_new} new units.")
 
     def kmeans_split_unit(self, unit_id):
         (in_unit_full,) = torch.nonzero(self.labels == unit_id, as_tuple=True)
-        in_unit, split_labels = self.kmeanspp(unit_id, n_clust=5, n_iter=10)
-        if np.unique(split_labels).size <= 1:
+        in_unit, split_labels, weights = self.kmeanspp(unit_id, n_clust=5, n_iter=50)
+        split_units, split_labels = torch.unique(split_labels, return_inverse=True)
+        if split_units.numel() <= 1:
             return 0, []
-        split_labels = self.constrain_split_centroids(in_unit, split_labels)
+        split_labels = self.constrain_split_centroids(in_unit, split_labels, weights=weights)
 
         split_units, counts = np.unique(split_labels, return_counts=True)
         n_split_full = split_units.size
@@ -1953,6 +1980,7 @@ class InterpClusterer(torch.nn.Module):
         n_threads=0,
         exclude_above=None,
         kind=None,
+        single=False,
     ):
         if unit_ids is None and units is None:
             unit_ids = self.unit_ids()
@@ -2081,14 +2109,56 @@ class InterpClusterer(torch.nn.Module):
 
         return divergences
 
-    def reassign(self, n_threads=0):
+    def reassignment_weights(
+        self,
+        which_spikes=None,
+        unit_ids=None,
+        units=None,
+        show_progress=True,
+        n_threads=0,
+        exclude_above=None,
+        kind=None,
+        single=False,
+        divergences=None,
+    ):
+        if divergences is None:
+            divergences = self.reassignment_divergences(
+                which_spikes=which_spikes, 
+                unit_ids=unit_ids, 
+                units=units, 
+                show_progress=show_progress, 
+                n_threads=n_threads, 
+                exclude_above=exclude_above, 
+                kind=kind, 
+                single=single, 
+            )
+        
+        # convert to torch sparse so we can do a softmax
+        coo = torch.from_numpy(divergences.coords[0]), torch.from_numpy(divergences.coords[1])
+        coo = torch.row_stack(coo)
+        weights = torch.sparse_coo_tensor(
+            coo,
+            torch.from_numpy(divergences.data).to(torch.float),
+            size=divergences.shape,
+        )
+
+        if kind in ("l2", "scaledl2"):
+            weights = torch.sparse.softmax(-0.5 * weights, dim=0)
+        elif kind == "1-r^2":
+            weights = torch.sparse.softmax(-5 * weights, dim=0)
+        else:
+            assert False
+        return weights
+
+    def reassign(self, n_threads=0, show_progress=True, verbose=True, return_divergences=False):
         divergences = self.reassignment_divergences(
-            n_threads=n_threads, exclude_above=self.match_threshold
+            n_threads=n_threads, exclude_above=self.match_threshold, show_progress=show_progress
         )
         new_labels = sparse_reassign(divergences, self.match_threshold)
 
         outlier_pct = 100 * (new_labels < 0).mean()
-        print(f"Reassignment marked {outlier_pct:.1f}% of spikes as outliers.")
+        if verbose:
+            print(f"Reassignment marked {outlier_pct:.1f}% of spikes as outliers.")
 
         new_labels = torch.as_tensor(
             new_labels, dtype=self.labels.dtype, device=self.labels.device
@@ -2096,9 +2166,27 @@ class InterpClusterer(torch.nn.Module):
         reas_pct = 100 * (self.labels != new_labels).to(torch.float).mean().numpy(
             force=True
         )
-        print(f"{reas_pct:.1f}% of spikes reassigned")
+        if verbose:
+            print(f"{reas_pct:.1f}% of spikes reassigned")
         self.labels.copy_(new_labels)
-        self.cleanup()
+        kept_labels = self.cleanup()
+
+        if not return_divergences:
+            return outlier_pct, reas_pct
+
+        # return responsibilities for caller
+        # thing is, we need to re-index the rows after the cleanup...
+        if kept_labels.size < divergences.shape[0]:
+            ii, jj = divergences.coords
+            ixs = np.searchsorted(kept_labels.numpy(force=True), ii)
+            np.clip(ixs, 0, kept_labels.numel(), out=ixs)
+            valid = np.flatnoznero(kept_labels[ixs] != ii)
+            divergences = coo_array(
+                (divergences.data[valid], (ii[valid], jj[valid])),
+                shape=(kept_labels.numel(), divergences.shape[1]),
+            )
+
+        return outlier_pct, reas_pct, divergences
 
     def get_indices(self, uid, n=None, in_unit=None, sampling_method=None):
         if n is None:
