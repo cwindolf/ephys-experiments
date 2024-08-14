@@ -21,6 +21,22 @@ import joblib
 
 tqdm_kw = dict(smoothing=0, mininterval=1 / 24)
 
+import time
+
+class timer:
+    def __init__(self, name="timer", format="{:0.1f}"):
+        self.name = name
+        self.format = format
+ 
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+ 
+    def __exit__(self, *args):
+        self.t = time.perf_counter() - self.start
+        t = self.format.format(self.t)
+        print(self.name, "took", t, "s")
+
 
 # -- helper classes
 
@@ -1097,10 +1113,6 @@ class InterpClusterer(torch.nn.Module):
                 for uid in self.unit_ids():
                     if uid not in self or self[uid].needs_fit:
                         to_fit.append(uid)
-
-        if show_progress:
-            to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
-        
         if weights_kind is not None and weights_sparse is None:
             weights_sparse = self.reassignment_weights(
                 unit_ids=to_fit,
@@ -1159,11 +1171,17 @@ class InterpClusterer(torch.nn.Module):
 
         fit_units = []
         if n_threads:
-            for model in joblib.Parallel(n_jobs=n_threads, backend="threading")(
+            res = joblib.Parallel(n_jobs=n_threads, backend="threading", return_as="generator")(
                 joblib.delayed(fit_unit)(j, uu) for j, uu in enumerate(to_fit)
-            ):
+            )
+            if show_progress:
+                res = tqdm(res, desc="M step", total=len(to_fit), **tqdm_kw)
+            for model in res:
                 fit_units.append(model)
         else:
+            if show_progress:
+                to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
+
             for j, uu in enumerate(to_fit):
                 fit_units.append(fit_unit(j, uu))
 
@@ -2121,6 +2139,10 @@ class InterpClusterer(torch.nn.Module):
         single=False,
         divergences=None,
     ):
+        div_kind = kind
+        if kind == "recipr2":
+            div_kind = "1-r^2"
+            kind = "recip"
         if divergences is None:
             divergences = self.reassignment_divergences(
                 which_spikes=which_spikes, 
@@ -2129,10 +2151,13 @@ class InterpClusterer(torch.nn.Module):
                 show_progress=show_progress, 
                 n_threads=n_threads, 
                 exclude_above=exclude_above, 
-                kind=kind, 
+                kind=div_kind, 
                 single=single, 
             )
-        
+
+        if "recip" in kind:
+            np.reciprocal(divergences.data, out=divergences.data)
+
         # convert to torch sparse so we can do a softmax
         coo = torch.from_numpy(divergences.coords[0]), torch.from_numpy(divergences.coords[1])
         coo = torch.row_stack(coo)
@@ -2141,11 +2166,14 @@ class InterpClusterer(torch.nn.Module):
             torch.from_numpy(divergences.data).to(torch.float),
             size=divergences.shape,
         )
+        weights = weights.to(self.device)
 
         if kind in ("l2", "scaledl2"):
             weights = torch.sparse.softmax(-0.5 * weights, dim=0)
         elif kind == "1-r^2":
             weights = torch.sparse.softmax(-5 * weights, dim=0)
+        elif kind == "recip":
+            pass
         else:
             assert False
         return weights
@@ -2176,11 +2204,11 @@ class InterpClusterer(torch.nn.Module):
 
         # return responsibilities for caller
         # thing is, we need to re-index the rows after the cleanup...
-        if kept_labels.size < divergences.shape[0]:
+        if kept_labels.numel() < divergences.shape[0]:
             ii, jj = divergences.coords
             ixs = np.searchsorted(kept_labels.numpy(force=True), ii)
             np.clip(ixs, 0, kept_labels.numel(), out=ixs)
-            valid = np.flatnoznero(kept_labels[ixs] != ii)
+            valid = np.flatnonzero(kept_labels[ixs] != ii)
             divergences = coo_array(
                 (divergences.data[valid], (ii[valid], jj[valid])),
                 shape=(kept_labels.numel(), divergences.shape[1]),
