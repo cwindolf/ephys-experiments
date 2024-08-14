@@ -34,6 +34,7 @@ class SpikeData(torch.nn.Module):
         waveform_rank: int,
         n_chans_unit: int,
         n_chans_waveform: int,
+        n_chans_reassign: int,
         n_spikes: int,
         keepers: np.ndarray,
         spike_train: data_util.DARTsortSorting,
@@ -65,6 +66,7 @@ class SpikeData(torch.nn.Module):
         self.waveform_rank = waveform_rank
         self.n_chans_unit = n_chans_unit
         self.n_chans_waveform = n_chans_waveform
+        self.n_chans_reassign = n_chans_reassign
         self.n_spikes = n_spikes
         self.in_memory = in_memory
         self.tpca = tpca
@@ -1043,20 +1045,28 @@ class InterpClusterer(torch.nn.Module):
         self.labels[kept] = new_labels.to(self.labels.dtype)[label_indices]
         self.labels[torch.logical_not(kept)] = -1
 
-    def cleanup(self, min_cluster_size=None):
+    def cleanup(self, min_cluster_size=None, remove_low_snr=False):
         """Remove small units and make labels contiguous."""
         old_labels, counts = torch.unique(self.labels, return_counts=True)
         counts = counts[old_labels >= 0]
         old_labels = old_labels[old_labels >= 0]
+
         if min_cluster_size is None:
             min_cluster_size = self.min_cluster_size
+
         big_enough = counts >= min_cluster_size
+        if remove_low_snr and self.channel_strategy == "snr" and len(self.models):
+            nc = [self[u].n_chans_unit for u in self.unit_ids()]
+            min_chans = self.data.n_chans_reassign * self.min_overlap
+            big_enough = torch.logical_and(big_enough, torch.tensor(nc) >= min_chans)
+
         n_removed = torch.logical_not(big_enough).sum()
         if n_removed:
             count_removed = counts[torch.logical_not(big_enough)].sum()
             pct_removed = 100 * count_removed / len(self.data.keepers)
             print(
-                f"Removed {n_removed} too-small units ({pct_removed:0.1f}% of spikes)."
+                f"Removed {n_removed} too-small units ({pct_removed:0.1f}% of spikes). "
+                f"New unit count: {big_enough.sum()}."
             )
         self.update_labels(old_labels[big_enough], flat=False)
         return old_labels[big_enough]
@@ -1100,7 +1110,7 @@ class InterpClusterer(torch.nn.Module):
 
         if show_progress:
             to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
-        
+
         if weights_kind is not None and weights_sparse is None:
             weights_sparse = self.reassignment_weights(
                 unit_ids=to_fit,
@@ -2132,7 +2142,7 @@ class InterpClusterer(torch.nn.Module):
                 kind=kind, 
                 single=single, 
             )
-        
+
         # convert to torch sparse so we can do a softmax
         coo = torch.from_numpy(divergences.coords[0]), torch.from_numpy(divergences.coords[1])
         coo = torch.row_stack(coo)
@@ -3045,6 +3055,7 @@ def _load_data(
         n_chans_full=n_chans_full,
         n_chans_unit=n_chans_unit,
         n_chans_waveform=n_chans_waveform,
+        n_chans_reassign=n_chans_reassign,
         n_spikes=n_spikes,
         motion_est=motion_est,
         original_channel_index=original_channel_index,
