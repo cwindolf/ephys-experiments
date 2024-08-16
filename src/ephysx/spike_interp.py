@@ -18,6 +18,7 @@ from sklearn.gaussian_process.kernels import RBF
 from scipy.spatial import KDTree
 import threading
 import joblib
+import numba
 
 tqdm_kw = dict(smoothing=0, mininterval=1 / 24)
 
@@ -364,6 +365,7 @@ class InterpUnit(torch.nn.Module):
             self.register_buffer("channel_reindexer", channel_reindexer)
             self.register_buffer("max_channel", max_channel)
         self.register_buffer("channels", channels)
+        self.register_buffer("channels_valid", channels[my_valid])
 
     def overlaps(self, static_channels):
         """
@@ -953,6 +955,7 @@ class InterpClusterer(torch.nn.Module):
         self.merge_with_bimodality = merge_with_bimodality
         self.bimodality_threshold = bimodality_threshold
         self._reas_bufs = {}
+        self.labels_lock = threading.Lock()
 
         self.data = _load_data(
             sorting,
@@ -1406,8 +1409,9 @@ class InterpClusterer(torch.nn.Module):
             which_spikes=in_unit_full,
             units=new_units,
             show_progress=False,
+            exclude_above=self.match_threshold,
         )
-        split_labels = sparse_reassign(divergences, self.match_threshold)
+        split_labels = sparse_reassign(divergences)
         unit.needs_fit = True
         kept = np.flatnonzero(split_labels >= 0)
 
@@ -1577,13 +1581,30 @@ class InterpClusterer(torch.nn.Module):
         )
         return labels
 
-    def kmeans_split(self, verbose=False):
+    def kmeans_split(self, verbose=False, n_threads=0):
         n_new = 0
-        for unit_id in tqdm(self.unit_ids(), desc="kmeans split"):
-            n_new_unit, newids = self.kmeans_split_unit(unit_id)
-            if verbose and newids:
-                print(f"{unit_id=} {newids=}")
-            n_new += n_new_unit
+        threaded = bool(n_threads)
+        if not threaded:
+            for unit_id in tqdm(self.unit_ids(), desc="kmeans split"):
+                n_new_unit, newids = self.kmeans_split_unit(unit_id)
+                if verbose and newids:
+                    print(f"{unit_id=} {newids=}")
+                n_new += n_new_unit
+        else:
+            jobs = self.unit_ids()
+            def job(unit_id):
+                return self.kmeans_split_unit(unit_id)
+            results = joblib.Parallel(
+                n_jobs=n_threads,
+                backend="threading",
+                return_as="generator",
+            )(joblib.delayed(job)(u) for u in jobs)
+            results = tqdm(results, desc="kmeans split", total=len(jobs))
+            for n_new_unit, newids in results:
+                if verbose and newids:
+                    print(f"{unit_id=} {newids=}")
+                n_new += n_new_unit
+
         print(f"kmeans split broke off {n_new} new units.")
 
     def kmeans_split_unit(self, unit_id):
@@ -1592,7 +1613,7 @@ class InterpClusterer(torch.nn.Module):
         split_units, split_labels = torch.unique(split_labels, return_inverse=True)
         if split_units.numel() <= 1:
             return 0, []
-        split_labels = self.constrain_split_centroids(unit_id, in_unit, split_labels, weights=weights)
+        split_labels_orig = split_labels = self.constrain_split_centroids(unit_id, in_unit, split_labels, weights=weights)
 
         split_units, counts = np.unique(split_labels, return_counts=True)
         n_split_full = split_units.size
@@ -1620,31 +1641,56 @@ class InterpClusterer(torch.nn.Module):
         # case 2: something legitimately took place.
         # here, split_unit 0 retains label uid. split units >=1 get new labels.
         assert n_split > 1, f"{n_split=} {n_split_full=}"
-        self.labels[in_unit_full] = -1
-        new_unit_ids = (
-            unit_id,
-            *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
-        )
-        for split_label, new_label in zip(split_units, new_unit_ids):
-            in_split = in_unit[split_labels == split_label]
-            self.labels[in_split] = new_label
 
-        # reassign within unit if necessary
         if not self.dpc_split_kw.reassign_within_split:
+            with self.labels_lock:
+                self.labels[in_unit_full] = -1
+                new_unit_ids = (
+                    unit_id,
+                    *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+                )
+                for split_label, new_label in zip(split_units, new_unit_ids):
+                    in_split = in_unit[split_labels == split_label]
+                    self.labels[in_split] = new_label
             return len(new_unit_ids) - 1, new_unit_ids
 
-        new_units = self.m_step(to_fit=new_unit_ids, store=False, show_progress=False)
+        # reassign within units
+        new_units = []
+        for j, label in enumerate(split_units):
+            u = InterpUnit(
+                do_interp=False,
+                **self.unit_kw,
+            )
+            inu = in_unit[split_labels == label]
+            inu, train_data = self.get_training_data(
+                unit_id=None,
+                waveform_kind="original",
+                in_unit=inu,
+                sampling_method=self.sampling_method,
+            )
+            u.fit_center(**train_data, show_progress=False)
+            new_units.append(u)
         divergences = self.reassignment_divergences(
             which_spikes=in_unit_full,
             units=new_units,
             show_progress=False,
+            exclude_above=self.match_threshold,
         )
-        split_labels = sparse_reassign(divergences, self.match_threshold)
+        split_labels = sparse_reassign(divergences)
         kept = np.flatnonzero(split_labels >= 0)
 
         # if reassign kills everything, just keep the state before reassignment
         if not kept.size:
-            return 0, []
+            with self.labels_lock:
+                self.labels[in_unit_full] = -1
+                new_unit_ids = (
+                    unit_id,
+                    *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+                )
+                for split_label, new_label in zip(split_units, new_unit_ids):
+                    in_split = in_unit[split_labels_orig == split_label]
+                    self.labels[in_split] = new_label
+            return len(new_unit_ids) - 1, new_unit_ids
 
         split_units, counts = np.unique(split_labels[kept], return_counts=True)
         split_units = split_units[counts >= self.min_cluster_size]
@@ -1652,14 +1698,15 @@ class InterpClusterer(torch.nn.Module):
         if n_split <= 1:
             return 0, []
 
-        self.labels[in_unit_full] = -1
-        new_unit_ids = (
-            unit_id,
-            *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
-        )
-        for split_label, new_label in zip(split_units, new_unit_ids):
-            in_split = in_unit_full[split_labels == split_label]
-            self.labels[in_split] = new_label
+        with self.labels_lock:
+            self.labels[in_unit_full] = -1
+            new_unit_ids = (
+                unit_id,
+                *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+            )
+            for split_label, new_label in zip(split_units, new_unit_ids):
+                in_split = in_unit_full[split_labels == split_label]
+                self.labels[in_split] = new_label
         return len(new_unit_ids) - 1, new_unit_ids
 
     def parcellate(self):
@@ -1904,7 +1951,7 @@ class InterpClusterer(torch.nn.Module):
         return n_split - 1
 
     def central_divergences(
-        self, units_a=None, units_b=None, kind=None, min_overlap=None
+        self, units_a=None, units_b=None, kind=None, min_overlap=None, n_threads=0
     ):
         if kind is None:
             kind = self.merge_metric
@@ -1920,11 +1967,30 @@ class InterpClusterer(torch.nn.Module):
             units_b = units
         nua = len(units_a)
         nub = len(units_b)
-        divergences = torch.full((nua, nub), torch.nan)
-        for i, ua in enumerate(units_a):
+        divergences = torch.full((nua, nub), torch.inf)
+
+        if not n_threads:
+            for i, ua in enumerate(units_a):
+                for j, ub in enumerate(units_b):
+                    if ua == ub:
+                        divergences[i, j] = 0
+                        continue
+                    divergences[i, j] = self[ua].divergence(
+                        self[ub],
+                        kind=kind,
+                        min_overlap=min_overlap,
+                        subset_channel_index=subset_channel_index,
+                    )
+            return divergences
+
+        jobs = list(enumerate(units_a))
+        def job(i, ua):
+            ca = self[ua].channels_valid
             for j, ub in enumerate(units_b):
                 if ua == ub:
                     divergences[i, j] = 0
+                    continue
+                if torch.isin(self[ub].channels_valid, ca).sum() < (self.merge_threshold * ca.numel()):
                     continue
                 divergences[i, j] = self[ua].divergence(
                     self[ub],
@@ -1932,6 +1998,14 @@ class InterpClusterer(torch.nn.Module):
                     min_overlap=min_overlap,
                     subset_channel_index=subset_channel_index,
                 )
+        results = joblib.Parallel(
+            n_jobs=n_threads,
+            backend="threading",
+            return_as="generator"
+        )(joblib.delayed(job)(*a) for a in jobs)
+        results = tqdm(results, total=len(jobs), desc="pairwise")
+        for _ in results:
+            pass
         return divergences
 
     def unit_bimodalities(
@@ -2020,10 +2094,11 @@ class InterpClusterer(torch.nn.Module):
 
         return scores
 
-    def merge(self):
+    def merge(self, n_threads=0):
         merge_dists = self.central_divergences(
             kind=self.merge_metric,
             min_overlap=self.min_overlap,
+            n_threads=n_threads,
         )
         merge_dists = self.merge_sym_function(merge_dists, merge_dists.T)
         merge_dists = merge_dists.numpy(force=True)
@@ -2246,7 +2321,7 @@ class InterpClusterer(torch.nn.Module):
         divergences = self.reassignment_divergences(
             n_threads=n_threads, exclude_above=self.match_threshold, show_progress=show_progress
         )
-        new_labels = sparse_reassign(divergences, self.match_threshold)
+        new_labels = sparse_reassign(divergences, None)
 
         outlier_pct = 100 * (new_labels < 0).mean()
         if verbose:
@@ -3512,24 +3587,33 @@ def mad(x, axis=None, keepdims=False):
     return np.median(x, axis=axis, keepdims=keepdims)
 
 
-def sparse_reassign(divergences, match_threshold):
+def sparse_reassign(divergences, match_threshold=None, batch_size=512):
+    # this uses CSC-specific tricks to do fast argmax per column
     if not divergences.nnz:
         return np.full(divergences.shape[0], -1)
 
-    # this uses CSC-specific tricks to do fast argmax
+    # see scipy csc argmin/argmax for reference here. this is just numba-ing
+    # a special case of that code which has a python hot loop.
     divergences = divergences.tocsc()
-
-    # sparse nonzero rows. this is CSC format specific.
-    has_match = np.diff(divergences.indptr) > 0
+    nz_lines = np.flatnonzero(np.diff(divergences.indptr))
+    errs = divergences if match_threshold is None else divergences.copy()
+    errs.data -= errs.data.max() + 1
+    assignments = np.full(errs.shape[1], -1)
+    hot_argmin_loop(assignments, nz_lines, errs.indptr, errs.data, errs.indices)
+    if match_threshold is None:
+        return assignments
 
     # we want sparse 0s to mean infinite err, and divs>thresh
     # to be infinite as well. right now, [0, 1] with 0 as best
     # subtract M to go to [-M, -M + 1].
-    errs = divergences.copy()
-    errs.data -= match_threshold + 212.0 + errs.data.max()
-    new_labels = np.where(has_match, errs.argmin(0), -1)
-    kept = np.flatnonzero(has_match)
-    outlandish = divergences[new_labels[kept], kept] >= match_threshold
-    new_labels[kept[outlandish]] = -1
+    outlandish = divergences[assignments[nz_lines], nz_lines] >= match_threshold
+    assignments[nz_lines[outlandish]] = -1
 
-    return new_labels
+    return assignments
+
+
+@numba.njit()
+def hot_argmin_loop(assignments, nz_lines, indptr, data, indices):
+    for i in nz_lines:
+        p, q = indptr[i:i + 2]
+        assignments[i] = indices[p:q][data[p:q].argmin()]
