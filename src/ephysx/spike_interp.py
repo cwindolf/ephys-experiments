@@ -318,48 +318,52 @@ class InterpUnit(torch.nn.Module):
     def _needs_to_be_fitted(self):
         assert not self.needs_fit
 
-    def determine_position_(self, static_amp_vecs, geom, cluster_channel_index):
+    def determine_position_(self, static_amp_vecs, geom, cluster_channel_index, channels=None, max_channel=None):
         if cluster_channel_index is not None:
             assert cluster_channel_index.shape == (self.n_chans_full, self.n_chans_unit)
+        
         device = static_amp_vecs.device
+        if channels is None:
+            count = torch.isfinite(static_amp_vecs).sum(0)
+            ampmean = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0))
+            snr = ampmean * torch.sqrt(count)
+            self.snr = snr
+            self.count = count
+            self.com = (snr * geom[:, 1]).sum() / snr.sum()
+            if self.channel_strategy in ("snr", "peak"):
+                max_channel = snr.argmax()
+            elif self.channel_strategy in ("com",):
+                fullcom = (snr[:, None] * geom).sum() / snr.sum()
+                max_channel = (geom - fullcom).square().sum(1).argmin()
+            else:
+                assert False
 
-        count = torch.isfinite(static_amp_vecs).sum(0)
-        ampmean = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0))
-        snr = ampmean * torch.sqrt(count)
-        self.snr = snr
-        self.count = count
-        self.com = (snr * geom[:, 1]).sum() / snr.sum()
-        if self.channel_strategy in ("snr", "peak"):
-            max_channel = snr.argmax()
-        elif self.channel_strategy in ("com",):
-            fullcom = (snr[:, None] * geom).sum() / snr.sum()
-            max_channel = (geom - fullcom).square().sum(1).argmin()
+            if self.channel_strategy in ("peak", "com"):
+                channels = cluster_channel_index[max_channel]
+            else:
+                mask = torch.logical_and(
+                    snr > self.channel_strategy_snr_min,
+                    ampmean > self.channel_strategy_snr_minamp,
+                )
+                (channels,) = torch.nonzero(mask, as_tuple=True)
         else:
-            assert False
+            channels = channels.clone()
+            max_channel = max_channel.clone()
 
-        if self.channel_strategy in ("peak", "com"):
-            my_chans = cluster_channel_index[max_channel]
-        else:
-            mask = torch.logical_and(
-                snr > self.channel_strategy_snr_min,
-                ampmean > self.channel_strategy_snr_minamp,
-            )
-            (my_chans,) = torch.nonzero(mask, as_tuple=True)
-            self.n_chans_unit = my_chans.numel()
-
+        self.n_chans_unit = channels.numel()
         channel_reindexer = torch.full(
             (self.n_chans_full + 1,), self.n_chans_unit, device=device
         )
-        my_valid = my_chans < self.n_chans_full
+        my_valid = channels < self.n_chans_full
         my_ixs = torch.arange(self.n_chans_unit, device=device)[my_valid]
-        channel_reindexer[my_chans[my_valid]] = my_ixs
+        channel_reindexer[channels[my_valid]] = my_ixs
         if hasattr(self, "channel_reindexer"):
             self.channel_reindexer.copy_(channel_reindexer)
             self.max_channel.copy_(max_channel)
         else:
             self.register_buffer("channel_reindexer", channel_reindexer)
             self.register_buffer("max_channel", max_channel)
-        self.register_buffer("channels", my_chans)
+        self.register_buffer("channels", channels)
 
     def overlaps(self, static_channels):
         """
@@ -452,7 +456,7 @@ class InterpUnit(torch.nn.Module):
         return waveforms_rel[..., : self.n_chans_unit]
 
     def to_waveform_channels(
-        self, waveforms_rel, waveform_channels=None, rel_ix=None, already_padded=False
+        self, waveforms_rel, waveform_channels=None, rel_ix=None, already_padded=False, constant_value=torch.nan
     ):
         if rel_ix is None:
             rel_ix = self.rel_ix(waveform_channels)
@@ -460,7 +464,7 @@ class InterpUnit(torch.nn.Module):
         n = waveforms_rel.shape[0]
         waveforms_rel = waveforms_rel.reshape(n, -1, self.n_chans_unit + already_padded)
         if not already_padded:
-            waveforms_rel = F.pad(waveforms_rel, (0, 1))
+            waveforms_rel = F.pad(waveforms_rel, (0, 1), value=constant_value)
         rel_ix = rel_ix[:, None, :].broadcast_to(
             (n, self.waveform_rank, rel_ix.shape[-1])
         )
@@ -559,25 +563,34 @@ class InterpUnit(torch.nn.Module):
         kinds=("l2", "1-r^2", "1-scaledr^2"),
         overlaps=None,
         rel_ix=None,
+        common_chans=False,
+        min_overlap=None,
     ):
         """Badnesses
 
         How bad is this unit at explaining waveforms on their channels?
         """
+        if min_overlap is None:
+            min_overlap = self.min_overlap
         # a client may already know exactly which spikes they want to compare
         spike_ix = slice(None)
         if rel_ix is None:
             overlaps, rel_ix = self.overlaps(waveform_channels)
-            (spike_ix,) = torch.nonzero(overlaps >= self.min_overlap, as_tuple=True)
+            (spike_ix,) = torch.nonzero(overlaps >= min_overlap, as_tuple=True)
             waveforms = waveforms[spike_ix]
             rel_ix = rel_ix[spike_ix]
             overlaps = overlaps[spike_ix]
             times = times[spike_ix]
 
         # masks are all or nothing along axis=1
+        # this mask says: which of each waveform's channels is one I have got?
         maskb = (rel_ix < self.n_chans_unit).unsqueeze(1)
         mask = maskb.to(waveforms)
-        waveforms = torch.nan_to_num(waveforms)
+        if common_chans:
+            mask *= torch.isfinite(waveforms[:, :1]).to(mask)
+            waveforms = torch.nan_to_num(waveforms * mask)
+        else:
+            waveforms = torch.nan_to_num(waveforms)
 
         # try to reconstruct spikes
         recons_rel = self.get_means(times, padded=True)
@@ -627,12 +640,16 @@ class InterpUnit(torch.nn.Module):
     def divergence(
         self,
         other,
-        kind="1-scaledr^2",
+        kind="1-r^2",
         aggregate=torch.amax,
-        min_overlap=0.5,
+        min_overlap=None,
         subset_channel_index=None,
+        common_chans=False,
     ):
         """Try to explain other units' mean (traces)"""
+        if min_overlap is None:
+            min_overlap = self.min_overlap
+
         other_channels = other.channels
         if subset_channel_index is not None:
             other_channels = subset_channel_index[other.max_channel]
@@ -655,10 +672,14 @@ class InterpUnit(torch.nn.Module):
                 waveform_channels=other_channels[None],
                 kinds=(kind,),
                 overlaps=overlaps,
+                min_overlap=min_overlap,
                 rel_ix=rel_ix,
+                common_chans=common_chans,
             )
             div = badnesses[kind].squeeze()
             return div
+
+        assert not common_chans
 
         # find grid times in common
         common_grid = torch.logical_and(
@@ -710,10 +731,18 @@ class InterpUnit(torch.nn.Module):
         show_progress=False,
         with_var=True,
         weights=None,
+        channels=None,
+        max_channel=None,
     ):
         # transfer waveform -> unit channels, filling with nans
         self.train()
-        self.determine_position_(static_amp_vecs, geom, cluster_channel_index)
+        self.determine_position_(
+            static_amp_vecs,
+            geom,
+            cluster_channel_index,
+            channels=channels,
+            max_channel=max_channel,
+        )
         self._init_models()
         self.to(waveforms.device)
         n = len(times)
@@ -1124,9 +1153,6 @@ class InterpClusterer(torch.nn.Module):
                     if uid not in self or self[uid].needs_fit:
                         to_fit.append(uid)
 
-        if show_progress:
-            to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
-
         if weights_kind is not None and weights_sparse is None:
             weights_sparse = self.reassignment_weights(
                 unit_ids=to_fit,
@@ -1406,7 +1432,13 @@ class InterpClusterer(torch.nn.Module):
         return len(new_unit_ids) - 1, new_unit_ids
 
     def kmeanspp(
-        self, unit_id, sampling_method="time_amp_reweighted", n_clust=5, n_iter=0
+        self,
+        unit_id,
+        sampling_method="time_amp_reweighted",
+        n_clust=5,
+        n_iter=0,
+        seed_with='mean',
+        drop_prop=0.05,
     ):
         in_unit, data = self.get_training_data(
             unit_id,
@@ -1432,12 +1464,17 @@ class InterpClusterer(torch.nn.Module):
         assignments = torch.zeros((n,), dtype=torch.long, device=self.labels.device)
         for j in range(n_clust):
             if j == 0:
-                newix = self.rg.integers(n)
+                if seed_with == 'random':
+                    newix = self.rg.integers(n)
+                elif seed_with == 'mean':
+                    newix = (waveforms - waveforms.mean(0)).square_().sum(1).argmax().numpy(force=True).item()
+                else:
+                    assert False
             else:
                 newix = self.rg.choice(n, p=(dists / dists.sum()).numpy(force=True))
             centroid_ixs.append(newix)
             curcent = waveforms[newix][None]
-            newdists = (waveforms - curcent).square().sum(1)
+            newdists = (waveforms - curcent).square_().sum(1)
             closer = newdists < dists
             assignments[closer] = j
             dists[closer] = newdists[closer]
@@ -1450,21 +1487,34 @@ class InterpClusterer(torch.nn.Module):
             dists = waveforms[:, None, :] - centroids[None, :, :]
             dists = dists.square_().sum(2)
             for i in range(n_iter):
-                # update centroids
+                # update responsibilities, n x k
                 e = F.softmax(-0.5 * dists, dim=1)
-                centroids = (e / e.sum(0)).T @ waveforms
+                
+                # delete too-small centroids
+                if drop_prop is not None:
+                    e = e[:, e.sum(0) >= drop_prop * n]
+
+                # update centroids
+                e = e.div_(e.sum(0))
+                centroids = e.T @ waveforms
                 dists = waveforms[:, None, :] - centroids[None, :, :]
                 dists = dists.square_().sum(2)
                 assignments = torch.argmin(dists, 1)
 
         return in_unit, assignments.to(in_unit), e
 
-    def constrain_split_centroids(self, in_unit, sub_labels, weights=None):
+    def constrain_split_centroids(self, unit_id, in_unit, sub_labels, weights=None, inherit_chans=True):
         ids = torch.unique(sub_labels)
         ids = ids[ids >= 0]
         new_units = []
 
         # fit sub-units
+        chan_kw = {}
+        if inherit_chans:
+            chan_kw = dict(
+                channels=self[unit_id].channels,
+                max_channel=self[unit_id].max_channel,
+            )
         for j, label in enumerate(ids):
             u = InterpUnit(
                 do_interp=False,
@@ -1480,7 +1530,7 @@ class InterpClusterer(torch.nn.Module):
                 in_unit=inu,
                 sampling_method=self.sampling_method,
             )
-            u.fit_center(**train_data, show_progress=False, weights=w)
+            u.fit_center(**train_data, show_progress=False, weights=w, **chan_kw)
             new_units.append(u)
 
         # remove dead units
@@ -1531,7 +1581,7 @@ class InterpClusterer(torch.nn.Module):
         n_new = 0
         for unit_id in tqdm(self.unit_ids(), desc="kmeans split"):
             n_new_unit, newids = self.kmeans_split_unit(unit_id)
-            if verbose:
+            if verbose and newids:
                 print(f"{unit_id=} {newids=}")
             n_new += n_new_unit
         print(f"kmeans split broke off {n_new} new units.")
@@ -1542,7 +1592,7 @@ class InterpClusterer(torch.nn.Module):
         split_units, split_labels = torch.unique(split_labels, return_inverse=True)
         if split_units.numel() <= 1:
             return 0, []
-        split_labels = self.constrain_split_centroids(in_unit, split_labels, weights=weights)
+        split_labels = self.constrain_split_centroids(unit_id, in_unit, split_labels, weights=weights)
 
         split_units, counts = np.unique(split_labels, return_counts=True)
         n_split_full = split_units.size
@@ -2218,14 +2268,16 @@ class InterpClusterer(torch.nn.Module):
 
         # return responsibilities for caller
         # thing is, we need to re-index the rows after the cleanup...
-        if kept_labels.numel() < divergences.shape[0]:
+        kept_labels = kept_labels.numpy(force=True)
+        if kept_labels.size < divergences.shape[0]:
+            # this is bugged..........
             ii, jj = divergences.coords
-            ixs = np.searchsorted(kept_labels.numpy(force=True), ii)
-            np.clip(ixs, 0, kept_labels.numel(), out=ixs)
+            ixs = np.searchsorted(kept_labels, ii)
+            np.clip(ixs, 0, kept_labels.size - 1, out=ixs)
             valid = np.flatnonzero(kept_labels[ixs] != ii)
             divergences = coo_array(
-                (divergences.data[valid], (ii[valid], jj[valid])),
-                shape=(kept_labels.numel(), divergences.shape[1]),
+                (divergences.data[valid], (ixs[valid], jj[valid])),
+                shape=(kept_labels.size, divergences.shape[1]),
             )
 
         return outlier_pct, reas_pct, divergences
