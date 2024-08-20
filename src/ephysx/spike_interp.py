@@ -1,28 +1,28 @@
 import dataclasses
+import threading
+import time
 from typing import Optional, Union
 
 from tqdm.auto import tqdm, trange
 
 import h5py
+import joblib
+import numba
 import numpy as np
 import torch
 import torch.nn.functional as F
 from dartsort.cluster import density, initial
 from dartsort.cluster.modes import smoothed_dipscore_at
-from dartsort.util import data_util, drift_util, waveform_util
 from dartsort.config import ClusteringConfig
+from dartsort.util import data_util, drift_util, waveform_util
 from scipy.cluster.hierarchy import fcluster, linkage
-from scipy.sparse import dok_array, coo_array
 from scipy.interpolate import PchipInterpolator
-from sklearn.gaussian_process.kernels import RBF
+from scipy.sparse import coo_array, dok_array
 from scipy.spatial import KDTree
-import threading
-import joblib
-import numba
+from sklearn.gaussian_process.kernels import RBF
 
 tqdm_kw = dict(smoothing=0, mininterval=1 / 24)
 
-import time
 
 class timer:
     def __init__(self, name="timer", format="{:0.1f}"):
@@ -1342,7 +1342,7 @@ class InterpClusterer(torch.nn.Module):
         features = features[:, : self.dpc_split_kw.rank].numpy(force=True)
         return in_unit_full, in_unit, features
 
-    def dpc_split_unit(self, uid):
+    def dpc_split_unit(self, unit_id):
         """
         Updates state by adding new models and updating labels etc after splitting a unit.
 
@@ -1351,8 +1351,8 @@ class InterpClusterer(torch.nn.Module):
         list of new IDs to split
         """
         # invariant: maintains contiguous label space of big-enough units
-        unit = self[uid]
-        in_unit_full, in_unit, features = self.split_features(uid)
+        unit = self[unit_id]
+        in_unit_full, in_unit, features = self.split_features(unit_id)
         if features is None:
             return 0, []
         if in_unit_full.numel() <= self.min_cluster_size:
@@ -1375,7 +1375,7 @@ class InterpClusterer(torch.nn.Module):
         del features
 
         # handle duplicates
-        split_labels = split_labels[inverse]
+        split_labels_orig = split_labels = split_labels[inverse]
 
         # -- deal with relabeling
         split_units, counts = np.unique(split_labels, return_counts=True)
@@ -1390,7 +1390,7 @@ class InterpClusterer(torch.nn.Module):
             if self.dpc_split_kw.allow_single_cluster_outlier_removal:
                 unit.needs_fit = True
                 self.labels[in_unit_full] = -1
-                self.labels[in_unit[split_labels >= 0]] = uid
+                self.labels[in_unit[split_labels >= 0]] = unit_id
                 return 0, []
 
         # case 0: nothing happened.
@@ -1401,25 +1401,39 @@ class InterpClusterer(torch.nn.Module):
         unit.needs_fit = True
 
         # case 2: something legitimately took place.
-        # here, split_unit 0 retains label uid. split units >=1 get new labels.
+        # here, split_unit 0 retains label unit_id. split units >=1 get new labels.
         assert n_split in (n_split_full, n_split_full - 1)
         assert n_split > 1
         assert split_units[0] == 0
-        with self.labels_lock:
-            self.labels[in_unit_full] = -1
-            new_unit_ids = (
-                uid,
-                *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
-            )
-            for split_label, new_label in zip(split_units, new_unit_ids):
-                in_split = in_unit[split_labels == split_label]
-                self.labels[in_split] = new_label
 
-        # reassign within unit if necessary
         if not self.dpc_split_kw.reassign_within_split:
+            with self.labels_lock:
+                self.labels[in_unit_full] = -1
+                new_unit_ids = (
+                    unit_id,
+                    *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+                )
+                for split_label, new_label in zip(split_units, new_unit_ids):
+                    in_split = in_unit[split_labels == split_label]
+                    self.labels[in_split] = new_label
             return len(new_unit_ids) - 1, new_unit_ids
 
-        new_units = self.m_step(to_fit=new_unit_ids, store=False, show_progress=False)
+        # reassign within units
+        new_units = []
+        for j, label in enumerate(split_units):
+            u = InterpUnit(
+                do_interp=False,
+                **self.unit_kw,
+            )
+            inu = in_unit[split_labels == label]
+            inu, train_data = self.get_training_data(
+                unit_id=None,
+                waveform_kind="original",
+                in_unit=inu,
+                sampling_method=self.sampling_method,
+            )
+            u.fit_center(**train_data, show_progress=False)
+            new_units.append(u)
         divergences = self.reassignment_divergences(
             which_spikes=in_unit_full,
             units=new_units,
@@ -1427,12 +1441,20 @@ class InterpClusterer(torch.nn.Module):
             exclude_above=self.match_threshold,
         )
         split_labels = sparse_reassign(divergences)
-        unit.needs_fit = True
         kept = np.flatnonzero(split_labels >= 0)
 
         # if reassign kills everything, just keep the state before reassignment
         if not kept.size:
-            return 0, []
+            with self.labels_lock:
+                self.labels[in_unit_full] = -1
+                new_unit_ids = (
+                    unit_id,
+                    *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+                )
+                for split_label, new_label in zip(split_units, new_unit_ids):
+                    in_split = in_unit[split_labels_orig == split_label]
+                    self.labels[in_split] = new_label
+            return len(new_unit_ids) - 1, new_unit_ids
 
         split_units, counts = np.unique(split_labels[kept], return_counts=True)
         split_units = split_units[counts >= self.min_cluster_size]
@@ -1443,12 +1465,13 @@ class InterpClusterer(torch.nn.Module):
         with self.labels_lock:
             self.labels[in_unit_full] = -1
             new_unit_ids = (
-                uid,
+                unit_id,
                 *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
             )
             for split_label, new_label in zip(split_units, new_unit_ids):
                 in_split = in_unit_full[split_labels == split_label]
                 self.labels[in_split] = new_label
+
         return len(new_unit_ids) - 1, new_unit_ids
 
     def kmeanspp(
