@@ -63,6 +63,7 @@ class SpikeData(torch.nn.Module):
         reassign_channel_index: np.ndarray,
         registered_original_channel_index: torch.tensor,
         registered_reassign_channel_index: torch.tensor,
+        static_main_channels: torch.tensor,
         cluster_channel_index: np.ndarray,
         amp_vecs: torch.Tensor,
         amps: np.ndarray,
@@ -96,12 +97,14 @@ class SpikeData(torch.nn.Module):
         # arrays not needed in torch
         self.original_channel_index = original_channel_index
         self.reassign_channel_index = reassign_channel_index
+        self.static_main_channels = torch.as_tensor(static_main_channels)
 
         # CPU tensors
         self.keepers = torch.from_numpy(keepers)
         self.amps = amps
         original_static_channels = torch.as_tensor(original_static_channels)
         reassign_static_channels = torch.as_tensor(reassign_static_channels)
+        self.register_buffer("reassign_static_channels", reassign_static_channels)
         if in_memory:
             original_tpca_embeds = torch.as_tensor(original_tpca_embeds)
             reassign_tpca_embeds = torch.as_tensor(reassign_tpca_embeds)
@@ -111,19 +114,16 @@ class SpikeData(torch.nn.Module):
             self.register_buffer("original_tpca_embeds", original_tpca_embeds)
             self.register_buffer("reassign_tpca_embeds", reassign_tpca_embeds)
             self.register_buffer("original_static_channels", original_static_channels)
-            self.register_buffer("reassign_static_channels", reassign_static_channels)
             self.register_buffer("amp_vecs", amp_vecs)
         elif pin and self.in_memory and torch.cuda.is_available():
             self.original_tpca_embeds = original_tpca_embeds.pin_memory()
             self.reassign_tpca_embeds = reassign_tpca_embeds.pin_memory()
             self.original_static_channels = original_static_channels.pin_memory()
-            self.reassign_static_channels = reassign_static_channels.pin_memory()
             self.amp_vecs = amp_vecs.pin_memory()
         else:
             self.original_tpca_embeds = original_tpca_embeds
             self.reassign_tpca_embeds = reassign_tpca_embeds
             self.original_static_channels = original_static_channels
-            self.reassign_static_channels = reassign_static_channels
             self.amp_vecs = amp_vecs
 
         # GPU
@@ -2526,11 +2526,13 @@ class InterpClusterer(torch.nn.Module):
             ssc = self.data.reassign_static_channels[which]
         else:
             assert False
+        waveforms = self.data.get_waveforms(
+            which, device=self.device, kind=waveform_kind
+        )
+        ssc = ssc.to(self.device)
         return dict(
             times=self.data.times_seconds[which],
-            waveforms=self.data.get_waveforms(
-                which, device=self.device, kind=waveform_kind
-            ),
+            waveforms=waveforms,
             waveform_channels=ssc,
         )
 
@@ -3154,6 +3156,7 @@ def _load_data(
     tpca_feature_name="collisioncleaned_tpca_features",
     interp_kind="nearest",
     drift_positions="channel",
+    kriging_sigma="pitch",
     rg=0,
 ):
     rg = np.random.default_rng(rg)
@@ -3239,7 +3242,7 @@ def _load_data(
     n_chans_unit = cluster_channel_index.shape[1]
     n_spikes = keepers.size
     print("Shifts...")
-    registered_depths_um = motion_est.correct_s(spike_depths, times_seconds)
+    registered_depths_um = motion_est.correct_s(times_seconds, depth_um=spike_depths)
     n_pitches_shift = drift_util.get_spike_pitch_shifts(
         spike_depths,
         geom=geom,
@@ -3275,19 +3278,19 @@ def _load_data(
         match_distance=match_distance,
         workers=4,
     )
-    # print(".")
-    # static_main_channels = drift_util.static_channel_neighborhoods(
-    #     geom,
-    #     channels,
-    #     np.arange(len(geom))[:, None],
-    #     pitch=pitch,
-    #     n_pitches_shift=n_pitches_shift,
-    #     registered_geom=registered_geom,
-    #     target_kdtree=registered_kdtree,
-    #     match_distance=match_distance,
-    #     workers=4,
-    # )
-    # static_main_channels = static_main_channels.squeeze()
+    print(".")
+    static_main_channels = drift_util.static_channel_neighborhoods(
+        geom,
+        channels,
+        np.arange(len(geom))[:, None],
+        pitch=pitch,
+        n_pitches_shift=n_pitches_shift,
+        registered_geom=registered_geom,
+        target_kdtree=registered_kdtree,
+        match_distance=match_distance,
+        workers=4,
+    )
+    static_main_channels = static_main_channels.squeeze()
     print("done.")
 
     # tpca embeds on channel subset
@@ -3297,6 +3300,8 @@ def _load_data(
         if interp_kind == "nearest":
             original_tpca_embeds = _read_by_chunk(keep_mask, original_tpca_embeds)
         elif interp_kind == "kriging":
+            if kriging_sigma == "pitch":
+                kriging_sigma = pitch
             shifts = registered_depths_um - spike_depths
             original_tpca_embeds = _krig_by_chunk(
                 keep_mask,
@@ -3307,6 +3312,7 @@ def _load_data(
                 shifts,
                 registered_geom,
                 original_static_channels,
+                sigma=kriging_sigma,
             )
         else:
             assert False
@@ -3363,7 +3369,7 @@ def _load_data(
         reassign_tpca_embeds=reassign_tpca_embeds,
         original_static_channels=original_static_channels,
         reassign_static_channels=reassign_static_channels,
-        # static_main_channels=static_main_channels,
+        static_main_channels=static_main_channels,
         registered_geom=registered_geom,
         in_memory=in_memory,
         on_device=on_device,
@@ -3533,7 +3539,6 @@ def reassign_by_chunk_inmem(gmm, sorting, batch_size=2 * 8192):
             divergences[j, which] = res[gmm.reassign_metric].numpy(force=True)
 
         # reassigned_labels[sli] = sparse_reassign(divergences, 1.0 - gmm.outlier_explained_var)
-
         has_match = np.isfinite(divergences).any(axis=0)
         new_labels = np.where(has_match, divergences.argmin(0), -1)
         kept = np.flatnonzero(has_match)
@@ -3735,12 +3740,15 @@ def _krig_by_chunk(
 
         # to torch
         x = torch.from_numpy(x).to(device)
-        source_channels = channel_index[channels[sli][m]].to(device)
-        source_shifts = shifts[sli][m].to(device)
+        source_channels = channel_index[channels[n : n + nm]].to(device)
+        # print(f"{(source_channels == len(geom)).sum(1)=}")
+        # print(f"{torch.isnan(x).all(1).sum(1)=}")
+        # print(f"{(target_channels[n : n + nm] == len(registered_geom)).sum(1)=}")
+        source_shifts = shifts[n : n + nm].to(device)
         source_shifts = torch.column_stack((zeros[:nm], source_shifts))
-        source_pos = source_geom[source_channels] + source_shifts
-        target_pos = target_geom[target_channels[sli][m].to(device)]
-        x = kriging_interpolate(x, source_pos, target_pos, sigma=sigma)
+        source_pos = source_geom[source_channels] + source_shifts.unsqueeze(1)
+        target_pos = target_geom[target_channels[n : n + nm].to(device)]
+        x = kriging_interpolate(x, source_pos, target_pos, sigma=sigma, allow_destroy=True)
 
         # x = dataset[np.arange(sli.start, sli.stop)[m]]
         out[n : n + nm] = x.numpy(force=True)
@@ -3750,23 +3758,28 @@ def _krig_by_chunk(
 
 
 def kriging_interpolate(
-    features, source_pos, target_pos, sigma=20.0, allow_destroy=False
+    features, source_pos, target_pos, sigma=20.0, allow_destroy=False, normalized=True
 ):
     # geoms should be nan-padded here.
     # build kernel
     kernel = torch.cdist(source_pos, target_pos)
     kernel = kernel.square_().mul_(-1.0 / (2 * sigma**2))
+    torch.nan_to_num(kernel, nan=-torch.inf, out=kernel)
+    if normalized:
+        kernel = F.softmax(kernel, dim=2)
+    else:
+        kernel = kernel.exp_()
     torch.nan_to_num(kernel, out=kernel)
 
     # and apply...
     n, rank = features.shape[:2]
     features = torch.nan_to_num(features, out=features if allow_destroy else None)
-    features = features.view(-1, source_pos.shape[1])
-    features = features @ kernel
-    features = features.view(n, rank, target_pos.shape[1])
+    features = torch.bmm(features, kernel)
 
-    needs_nan = torch.isnan(target_pos).all(2)
-    features[needs_nan.unsqueeze(1)] = torch.nan
+    # nan-ify nonexistent chans
+    needs_nan = torch.isnan(target_pos).all(2).unsqueeze(1)
+    needs_nan = needs_nan.broadcast_to(features.shape)
+    features[needs_nan] = torch.nan
 
     return features
 
@@ -3839,7 +3852,6 @@ def sparse_reassign(divergences, match_threshold=None, batch_size=512):
     ),
     error_model="numpy",
     nogil=True,
-    parallel=True,
 )
 def hot_argmin_loop(assignments, nz_lines, indptr, data, indices):
     for i in nz_lines:
