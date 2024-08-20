@@ -943,6 +943,8 @@ class InterpClusterer(torch.nn.Module):
         channel_strategy_snr_min=25.0,
         channel_strategy_snr_minamp=2.5,
         merge_on_waveform_radius=True,
+        interp_kind="nearest",
+        drift_positions="channel",
         match_threshold=1.0,
         sampling_sigma=0.5,
         label_dtype=torch.int32,
@@ -986,6 +988,8 @@ class InterpClusterer(torch.nn.Module):
             pin=pin,
             rg=self.rg,
             tpca_feature_name=tpca_feature_name,
+            interp_kind=interp_kind,
+            drift_positions=drift_positions,
         )
         self.residual_pca_rank = residual_pca_rank
         self.unit_kw = dict(
