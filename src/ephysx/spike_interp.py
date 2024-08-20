@@ -1117,7 +1117,7 @@ class InterpClusterer(torch.nn.Module):
                 f"New unit count: {big_enough.sum()}."
             )
         self.update_labels(old_labels[big_enough], flat=False)
-        return old_labels[big_enough]
+        return big_enough
 
     def order_by_depth(self):
         """Reorder labels by unit CoM depth."""
@@ -1285,17 +1285,31 @@ class InterpClusterer(torch.nn.Module):
         n_orig = len(unit_ids_to_split)
         n_splits = []
 
+        @joblib.delayed
+        def job(unit_id):
+            return self.dpc_split_unit(unit_id)
+
+        pool = joblib.Parallel(
+            n_jobs=max(1, n_threads),
+            backend="threading",
+            return_as="generator",
+        )
+
         while unit_ids_to_split:
             next_ids_to_split = []
             ns = 0
-            for uid in tqdm(
-                unit_ids_to_split, desc=f"Split round {len(n_splits)}", **tqdm_kw
-            ):
-                nnew, new_splits = self.dpc_split_unit(uid)
+            results = pool(job(uid) for uid in unit_ids_to_split)
+            results = tqdm(
+                results,
+                total=len(unit_ids_to_split),
+                desc=f"Split round {len(n_splits)}",
+                **tqdm_kw,
+            )
+            for nnew, new_splits in results:
                 next_ids_to_split.extend(new_splits)
                 ns += nnew
             n_splits.append(ns)
-            self.m_step(fit_residual=False, n_threads=0, show_progress=False)
+            self.m_step(fit_residual=False, n_threads=n_threads, show_progress=False)
             self.m_step(
                 fit_residual=True, to_fit=next_ids_to_split, n_threads=n_threads
             )
@@ -1391,14 +1405,15 @@ class InterpClusterer(torch.nn.Module):
         assert n_split in (n_split_full, n_split_full - 1)
         assert n_split > 1
         assert split_units[0] == 0
-        self.labels[in_unit_full] = -1
-        new_unit_ids = (
-            uid,
-            *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
-        )
-        for split_label, new_label in zip(split_units, new_unit_ids):
-            in_split = in_unit[split_labels == split_label]
-            self.labels[in_split] = new_label
+        with self.labels_lock:
+            self.labels[in_unit_full] = -1
+            new_unit_ids = (
+                uid,
+                *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+            )
+            for split_label, new_label in zip(split_units, new_unit_ids):
+                in_split = in_unit[split_labels == split_label]
+                self.labels[in_split] = new_label
 
         # reassign within unit if necessary
         if not self.dpc_split_kw.reassign_within_split:
@@ -1425,14 +1440,15 @@ class InterpClusterer(torch.nn.Module):
         if n_split <= 1:
             return 0, []
 
-        self.labels[in_unit_full] = -1
-        new_unit_ids = (
-            uid,
-            *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
-        )
-        for split_label, new_label in zip(split_units, new_unit_ids):
-            in_split = in_unit_full[split_labels == split_label]
-            self.labels[in_split] = new_label
+        with self.labels_lock:
+            self.labels[in_unit_full] = -1
+            new_unit_ids = (
+                uid,
+                *(self.labels.max() + torch.arange(1, n_split, dtype=self.labels.dtype)),
+            )
+            for split_label, new_label in zip(split_units, new_unit_ids):
+                in_split = in_unit_full[split_labels == split_label]
+                self.labels[in_split] = new_label
         return len(new_unit_ids) - 1, new_unit_ids
 
     def kmeanspp(
@@ -2277,6 +2293,7 @@ class InterpClusterer(torch.nn.Module):
         kind=None,
         single=False,
         divergences=None,
+        max_weight=1e2,
     ):
         div_kind = kind
         if kind == "recipr2":
@@ -2295,6 +2312,7 @@ class InterpClusterer(torch.nn.Module):
             )
 
         if "recip" in kind:
+            divergences.data.clip(min=1.0 / max_weight, out=divergences.data)
             np.reciprocal(divergences.data, out=divergences.data)
 
         # convert to torch sparse so we can do a softmax
@@ -2336,23 +2354,22 @@ class InterpClusterer(torch.nn.Module):
         if verbose:
             print(f"{reas_pct:.1f}% of spikes reassigned")
         self.labels.copy_(new_labels)
-        kept_labels = self.cleanup()
+        keep_mask = self.cleanup()
 
         if not return_divergences:
-            return outlier_pct, reas_pct
+            return outlier_pct, reas_pct, None
 
         # return responsibilities for caller
-        # thing is, we need to re-index the rows after the cleanup...
-        kept_labels = kept_labels.numpy(force=True)
-        if kept_labels.size < divergences.shape[0]:
-            # this is bugged..........
+        # thing is, we need to re-index the rows after the cleanup
+        kept_label_indices = np.flatnonzero(keep_mask.numpy(force=True))
+        if kept_label_indices.size < divergences.shape[0]:
             ii, jj = divergences.coords
-            ixs = np.searchsorted(kept_labels, ii)
-            np.clip(ixs, 0, kept_labels.size - 1, out=ixs)
-            valid = np.flatnonzero(kept_labels[ixs] != ii)
+            ixs = np.searchsorted(kept_label_indices, ii)
+            ixs.clip(0, kept_label_indices.size - 1, out=ixs)
+            valid = np.flatnonzero(kept_label_indices[ixs] == ii)
             divergences = coo_array(
                 (divergences.data[valid], (ixs[valid], jj[valid])),
-                shape=(kept_labels.size, divergences.shape[1]),
+                shape=(kept_label_indices.size, divergences.shape[1]),
             )
 
         return outlier_pct, reas_pct, divergences
@@ -3612,8 +3629,16 @@ def sparse_reassign(divergences, match_threshold=None, batch_size=512):
     return assignments
 
 
-@numba.njit()
+@numba.njit(
+    numba.void(numba.int64[:], numba.int64[:], numba.int32[:], numba.float32[:], numba.int32[:]),
+    error_model="numpy",
+    nogil=True,
+    parallel=True,
+)
 def hot_argmin_loop(assignments, nz_lines, indptr, data, indices):
     for i in nz_lines:
-        p, q = indptr[i:i + 2]
-        assignments[i] = indices[p:q][data[p:q].argmin()]
+        p = indptr[i]
+        q = indptr[i + 1]
+        ix = indices[p:q]
+        dx = data[p:q]
+        assignments[i] = ix[dx.argmin()]
