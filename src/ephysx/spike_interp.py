@@ -3299,11 +3299,11 @@ def _load_data(
     if in_memory:
         if interp_kind == "nearest":
             original_tpca_embeds = _read_by_chunk(keep_mask, original_tpca_embeds)
-        elif interp_kind == "kriging":
+        elif interp_kind in ("normalized", "kriging", "kernel"):
             if kriging_sigma == "pitch":
                 kriging_sigma = pitch
             shifts = registered_depths_um - spike_depths
-            original_tpca_embeds = _krig_by_chunk(
+            original_tpca_embeds = _interp_by_chunk(
                 keep_mask,
                 original_tpca_embeds,
                 geom,
@@ -3313,6 +3313,7 @@ def _load_data(
                 registered_geom,
                 original_static_channels,
                 sigma=kriging_sigma,
+                interp_kind=interp_kind,
             )
         else:
             assert False
@@ -3686,7 +3687,7 @@ def _read_by_chunk(mask, dataset, show_progress=True):
     return out
 
 
-def _krig_by_chunk(
+def _interp_by_chunk(
     mask,
     dataset,
     geom,
@@ -3699,6 +3700,7 @@ def _krig_by_chunk(
     sigma=20.0,
     show_progress=True,
     dtype=torch.float,
+    interp_kind="kriging",
 ):
     """
     mask : boolean array of shape dataset.shape[:1]
@@ -3748,7 +3750,7 @@ def _krig_by_chunk(
         source_shifts = torch.column_stack((zeros[:nm], source_shifts))
         source_pos = source_geom[source_channels] + source_shifts.unsqueeze(1)
         target_pos = target_geom[target_channels[n : n + nm].to(device)]
-        x = kriging_interpolate(x, source_pos, target_pos, sigma=sigma, allow_destroy=True)
+        x = kernel_interpolate(x, source_pos, target_pos, sigma=sigma, allow_destroy=True, kind=interp_kind)
 
         # x = dataset[np.arange(sli.start, sli.stop)[m]]
         out[n : n + nm] = x.numpy(force=True)
@@ -3757,18 +3759,36 @@ def _krig_by_chunk(
     return out
 
 
-def kriging_interpolate(
-    features, source_pos, target_pos, sigma=20.0, allow_destroy=False, normalized=True
+def kernel_interpolate(
+    features,
+    source_pos,
+    target_pos,
+    sigma=20.0,
+    allow_destroy=False,
+    kind="normalized",
+    eps=1e-2,
 ):
     # geoms should be nan-padded here.
     # build kernel
     kernel = torch.cdist(source_pos, target_pos)
     kernel = kernel.square_().mul_(-1.0 / (2 * sigma**2))
     torch.nan_to_num(kernel, nan=-torch.inf, out=kernel)
-    if normalized:
+    if kind == "normalized":
         kernel = F.softmax(kernel, dim=2)
-    else:
+    elif kind == "kriging":
         kernel = kernel.exp_()
+        self_kernel = torch.cdist(source_pos, source_pos)
+        self_kernel = self_kernel.square_().mul_(-1.0 / (2 * sigma**2))
+        torch.nan_to_num(self_kernel, nan=-torch.inf, out=self_kernel)
+        self_kernel = self_kernel.exp_()
+        self_kernel.diagonal(dim1=1, dim2=2).add_(eps)
+        kernel = torch.linalg.lstsq(self_kernel, kernel).solution
+        # kernel = torch.bmm(torch.linalg.pinv(self_kernel, hermitian=True), kernel)
+        # kernel = eigh_lstsq(self_kernel, kernel)
+    elif kind == "kernel":
+        kernel = kernel.exp_()
+    else:
+        assert False
     torch.nan_to_num(kernel, out=kernel)
 
     # and apply...
@@ -3782,6 +3802,24 @@ def kriging_interpolate(
     features[needs_nan] = torch.nan
 
     return features
+
+
+def svd_lstsq(AA, BB, tol=1e-5, driver='gesvd'):
+    U, S, Vh = torch.linalg.svd(AA, full_matrices=False, driver=driver)
+    Spinv = torch.zeros_like(S)
+    Spinv[S>tol] = 1/S[S>tol]
+    UhBB = U.adjoint() @ BB
+    if Spinv.ndim!=UhBB.ndim:
+        Spinv = Spinv.unsqueeze(-1)
+    SpinvUhBB = Spinv * UhBB
+    return Vh.adjoint() @ SpinvUhBB
+
+
+def eigh_lstsq(AA, BB, tol=1e-5):
+    S, Q = torch.linalg.eigh(AA)
+    valid = S > tol
+    S[valid] = 1.0 / S[valid]
+    return torch.einsum("nuv,nv,nwv,nwx->nux", Q, S, Q, BB)
 
 
 def _channel_subset_by_chunk(
