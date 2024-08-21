@@ -955,6 +955,7 @@ class InterpClusterer(torch.nn.Module):
         pin=False,
         batch_size=16384,
         tpca_feature_name="collisioncleaned_tpca_features",
+        kriging_sigma="pitch",
         rg=0,
     ):
         super().__init__()
@@ -991,6 +992,7 @@ class InterpClusterer(torch.nn.Module):
             tpca_feature_name=tpca_feature_name,
             interp_kind=interp_kind,
             drift_positions=drift_positions,
+            kriging_sigma=kriging_sigma,
         )
         self.residual_pca_rank = residual_pca_rank
         self.unit_kw = dict(
