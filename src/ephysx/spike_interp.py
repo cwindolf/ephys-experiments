@@ -763,6 +763,7 @@ class InterpUnit(torch.nn.Module):
         self._init_models()
         self.to(waveforms.device)
         n = len(times)
+        assert n > 0
         rel_ix = self.rel_ix(waveform_channels)
         waveforms_rel = self.to_unit_channels(
             waveforms,
@@ -1336,6 +1337,7 @@ class InterpClusterer(torch.nn.Module):
                 ns += nnew
             n_splits.append(ns)
             self.m_step(fit_residual=False, n_threads=n_threads, show_progress=False)
+            self.cleanup(remove_low_snr=True)
             self.m_step(
                 fit_residual=True, to_fit=next_ids_to_split, n_threads=n_threads
             )
