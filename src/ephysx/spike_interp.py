@@ -77,6 +77,7 @@ class SpikeData(torch.nn.Module):
         pin: bool = True,
         on_device: bool = False,
         tpca: Optional["TemporalPCAFeaturizer"] = None,
+        kriging_sigma: Optional[float] = None,
     ):
         super().__init__()
         self.n_chans_full = n_chans_full
@@ -90,6 +91,7 @@ class SpikeData(torch.nn.Module):
         self.geom = geom
         self.times_samples = times_samples
         self.pin = pin
+        self.kriging_sigma = kriging_sigma
 
         self.spike_train = spike_train
         self.motion_est = motion_est
@@ -127,7 +129,8 @@ class SpikeData(torch.nn.Module):
             self.amp_vecs = amp_vecs
 
         # GPU
-        self.register_buffer("registered_geom", torch.as_tensor(registered_geom))
+        self.register_buffer("registered_geom", torch.as_tensor(registered_geom, dtype=self.original_tpca_embeds.dtype))
+        self.register_buffer("padded_registered_geom", F.pad(self.registered_geom, (0, 0, 0, 1), value=torch.nan))
         self.register_buffer(
             "cluster_channel_index", torch.as_tensor(cluster_channel_index)
         )
@@ -262,6 +265,7 @@ class InterpUnit(torch.nn.Module):
         channel_strategy_snr_minamp=3.0,
         var_prior_count=5.0,
         var_cov_max=0.05,
+        kriging_sigma=None,
         batch_size=16384,
         pca_on_waveform_channels=True,
         scale_residual_embed=False,
@@ -282,6 +286,7 @@ class InterpUnit(torch.nn.Module):
         self.batch_size = batch_size
         self.var_prior_count = var_prior_count
         self.var_cov_max = var_cov_max
+        self.kriging_sigma = kriging_sigma
 
         pca_centered = True
         if self.do_interp:
@@ -820,8 +825,9 @@ class InterpUnit(torch.nn.Module):
         waveforms,
         waveform_channels,
         waveform_channel_index=None,
+        imputation_kind="pca",
+        padded_registered_geom=None,
     ):
-        rel_ix = self.rel_ix(waveform_channels)
         n = len(times)
         residuals = self.residuals_rel(
             times,
@@ -834,13 +840,41 @@ class InterpUnit(torch.nn.Module):
             wfcs = waveform_channel_index[self.max_channel]
             wfcs = wfcs[None].broadcast_to((len(residuals), *wfcs.shape))
             residuals = self.to_waveform_channels(residuals, wfcs)
-        embeds = self.pca.transform_precentered(residuals)
-        recons = self.pca.backward_precentered(embeds)
+
+        if imputation_kind == "pca":
+            assert not self.needs_fit
+            embeds = self.pca.transform_precentered(residuals)
+            recons = self.pca.backward_precentered(embeds)
+        elif imputation_kind == "kriging":
+            residuals = residuals.view((n, self.waveform_rank, -1))
+            assert not self.pca_on_waveform_channels, "Could support this with target kernel"
+            source_pos = padded_registered_geom[self.channels]
+            source_kernel = torch.cdist(source_pos, source_pos)
+            source_kernel = source_kernel.square_().mul_(-1.0 / (2 * self.kriging_sigma**2))
+            torch.nan_to_num(source_kernel, nan=-torch.inf, out=source_kernel)
+            source_kernel = source_kernel.exp_()
+            source_inv = torch.linalg.pinv(source_kernel)
+            source_pos = source_pos[None].broadcast_to((n, *source_pos.shape))
+            source_inv = source_inv[None].broadcast_to((n, *source_inv.shape))
+            target_pos = padded_registered_geom[self.channels]
+            target_pos = target_pos[None].broadcast_to((n, *target_pos.shape))
+            recons = kernel_interpolate(
+                residuals,
+                source_pos,
+                target_pos,
+                source_kernel_invs=None,
+                sigma=20.0,
+                allow_destroy=False,
+                kind="normalized",
+            )
+        else:
+            assert False
         imputed = torch.where(
-            torch.isfinite(residuals),
-            residuals,
-            recons,
+            torch.isfinite(residuals.view(n, -1)),
+            residuals.view(n, -1),
+            recons.view(n, -1),
         )
+        assert torch.isfinite(imputed).all()
         return imputed
 
     def fit_residual(
@@ -945,6 +979,7 @@ class InterpClusterer(torch.nn.Module):
         channel_strategy_snr_minamp=2.5,
         merge_on_waveform_radius=True,
         interp_kind="nearest",
+        imputation_kind="pca",
         drift_positions="channel",
         match_threshold=1.0,
         sampling_sigma=0.5,
@@ -976,6 +1011,7 @@ class InterpClusterer(torch.nn.Module):
         self.bimodality_threshold = bimodality_threshold
         self._reas_bufs = {}
         self.labels_lock = threading.Lock()
+        self.imputation_kind = imputation_kind
 
         self.data = _load_data(
             sorting,
@@ -1009,6 +1045,7 @@ class InterpClusterer(torch.nn.Module):
             channel_strategy=channel_strategy,
             channel_strategy_snr_min=channel_strategy_snr_min,
             channel_strategy_snr_minamp=channel_strategy_snr_minamp,
+            kriging_sigma=self.data.kriging_sigma,
         )
 
         torch.manual_seed(self.rg.bit_generator.random_raw())
@@ -1535,6 +1572,8 @@ class InterpClusterer(torch.nn.Module):
             data["waveforms"],
             data["waveform_channels"],
             data["waveform_channel_index"],
+            imputation_kind=self.imputation_kind,
+            padded_registered_geom=self.data.padded_registered_geom,
         )
 
         # pick centroids and reassign imputed wfs
@@ -3381,6 +3420,7 @@ def _load_data(
         pin=pin,
         tpca=tpca,
         geom=geom,
+        kriging_sigma=kriging_sigma,
     )
 
 
@@ -3737,6 +3777,15 @@ def _interp_by_chunk(
             desc=f"Interpolated {dataset.name}",
         )
 
+    source_invs = None
+    if interp_kind == "kriging":
+        source_pos = source_geom[channel_index].to(device)
+        source_kernel = torch.cdist(source_pos, source_pos)
+        source_kernel = source_kernel.square_().mul_(-1.0 / (2 * sigma**2))
+        torch.nan_to_num(source_kernel, nan=-torch.inf, out=source_kernel)
+        source_kernel = source_kernel.exp_()
+        source_invs = torch.linalg.pinv(source_kernel)
+
     for sli, *_ in chunks:
         m = np.flatnonzero(mask[sli])
         nm = m.size
@@ -3754,7 +3803,8 @@ def _interp_by_chunk(
         source_shifts = torch.column_stack((zeros[:nm], source_shifts))
         source_pos = source_geom[source_channels] + source_shifts.unsqueeze(1)
         target_pos = target_geom[target_channels[n : n + nm].to(device)]
-        x = kernel_interpolate(x, source_pos, target_pos, sigma=sigma, allow_destroy=True, kind=interp_kind)
+        ski = source_invs[channels[n:n+nm]] if interp_kind == "kriging" else None
+        x = kernel_interpolate(x, source_pos, target_pos, sigma=sigma, allow_destroy=True, kind=interp_kind, source_kernel_invs=ski)
 
         # x = dataset[np.arange(sli.start, sli.stop)[m]]
         out[n : n + nm] = x.numpy(force=True)
@@ -3767,10 +3817,10 @@ def kernel_interpolate(
     features,
     source_pos,
     target_pos,
+    source_kernel_invs=None,
     sigma=20.0,
     allow_destroy=False,
     kind="normalized",
-    eps=1e-2,
 ):
     # geoms should be nan-padded here.
     # build kernel
@@ -3781,14 +3831,7 @@ def kernel_interpolate(
         kernel = F.softmax(kernel, dim=2)
     elif kind == "kriging":
         kernel = kernel.exp_()
-        self_kernel = torch.cdist(source_pos, source_pos)
-        self_kernel = self_kernel.square_().mul_(-1.0 / (2 * sigma**2))
-        torch.nan_to_num(self_kernel, nan=-torch.inf, out=self_kernel)
-        self_kernel = self_kernel.exp_()
-        self_kernel.diagonal(dim1=1, dim2=2).add_(eps)
-        kernel = torch.linalg.lstsq(self_kernel, kernel).solution
-        # kernel = torch.bmm(torch.linalg.pinv(self_kernel, hermitian=True), kernel)
-        # kernel = eigh_lstsq(self_kernel, kernel)
+        kernel = source_kernel_invs @ kernel
     elif kind == "kernel":
         kernel = kernel.exp_()
     else:
