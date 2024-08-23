@@ -265,6 +265,8 @@ class InterpUnit(torch.nn.Module):
         channel_strategy_snr_minamp=3.0,
         var_prior_count=5.0,
         var_cov_max=0.05,
+        imputation_kind=None,
+        impute_before_center=False,
         kriging_sigma=None,
         batch_size=16384,
         pca_on_waveform_channels=True,
@@ -286,6 +288,8 @@ class InterpUnit(torch.nn.Module):
         self.batch_size = batch_size
         self.var_prior_count = var_prior_count
         self.var_cov_max = var_cov_max
+        self.imputation_kind = imputation_kind
+        self.impute_before_center = impute_before_center
         self.kriging_sigma = kriging_sigma
 
         pca_centered = True
@@ -503,6 +507,8 @@ class InterpUnit(torch.nn.Module):
         out=None,
         embed=False,
         padded=False,
+        fill_mode="mean",
+        constant_value=torch.nan,
     ):
         if batch_size is None:
             batch_size = self.batch_size
@@ -524,8 +530,14 @@ class InterpUnit(torch.nn.Module):
         for j in range(0, n, batch_size):
             sl = slice(j, min(j + batch_size, n))
             means_rel = self.get_means(times[sl], padded=True)
+            if fill_mode == "mean":
+                fill_kw = dict(fill_mode=means_rel.clone())
+            else:
+                fill_kw = dict(fill_mode=fill_mode, constant_value=constant_value)
             resids = self.to_unit_channels(
-                waveforms=waveforms[sl], rel_ix=rel_ix[sl], fill_mode=means_rel.clone()
+                waveforms=waveforms[sl],
+                rel_ix=rel_ix[sl],
+                **fill_kw,
             )
             means_rel = means_rel[..., :-1]
             if self.scale_residual_embed:
@@ -748,6 +760,7 @@ class InterpUnit(torch.nn.Module):
         waveform_channels,
         static_amp_vecs,
         geom,
+        padded_geom=None,
         cluster_channel_index=None,
         waveform_channel_index=None,
         show_progress=False,
@@ -769,14 +782,22 @@ class InterpUnit(torch.nn.Module):
         self.to(waveforms.device)
         n = len(times)
         assert n > 0
-        rel_ix = self.rel_ix(waveform_channels)
-        waveforms_rel = self.to_unit_channels(
-            waveforms,
-            times,
-            rel_ix=rel_ix,
-            fill_mode="constant",
-            constant_value=torch.nan,
-        )
+        if self.impute_before_center:
+            waveforms_rel = self.impute(
+                times,
+                waveforms,
+                waveform_channels,
+                padded_registered_geom=padded_geom,
+                centered=False,
+            )
+        else:
+            waveforms_rel = self.to_unit_channels(
+                waveforms,
+                times,
+                waveform_channels=waveform_channels,
+                fill_mode="constant",
+                constant_value=torch.nan,
+            )
 
         # fit/transform with the interpolator
         if self.do_interp:
@@ -825,27 +846,36 @@ class InterpUnit(torch.nn.Module):
         waveforms,
         waveform_channels,
         waveform_channel_index=None,
-        imputation_kind="pca",
+        imputation_kind=None,
         padded_registered_geom=None,
+        centered=True,
     ):
         n = len(times)
-        residuals = self.residuals_rel(
-            times,
-            waveforms,
-            waveform_channels,
-            padded=False,
-        )
-        residuals = residuals.reshape(n, -1)
-        if self.pca_on_waveform_channels:
-            wfcs = waveform_channel_index[self.max_channel]
-            wfcs = wfcs[None].broadcast_to((len(residuals), *wfcs.shape))
-            residuals = self.to_waveform_channels(residuals, wfcs)
+        imputation_kind = self.imputation_kind
 
         if imputation_kind == "pca":
             assert not self.needs_fit
+            assert centered
+            residuals = self.residuals_rel(
+                times,
+                waveforms,
+                waveform_channels,
+                padded=False,
+                fill_mode="mean" if imputation_kind == "pca" else "constant",
+            )
+            residuals = residuals.reshape(n, -1)
+            if self.pca_on_waveform_channels:
+                wfcs = waveform_channel_index[self.max_channel]
+                wfcs = wfcs[None].broadcast_to((len(residuals), *wfcs.shape))
+                residuals = self.to_waveform_channels(residuals, wfcs)
             embeds = self.pca.transform_precentered(residuals)
             recons = self.pca.backward_precentered(embeds)
-        elif imputation_kind == "kriging":
+            imputed = torch.where(
+                torch.isfinite(residuals.view(n, -1)),
+                residuals.view(n, -1),
+                recons.view(n, -1),
+            )
+        elif imputation_kind.startswith("kriging"):
             residuals = residuals.view((n, self.waveform_rank, -1))
             assert not self.pca_on_waveform_channels, "Could support this with target kernel"
             source_pos = padded_registered_geom[self.channels]
@@ -862,19 +892,32 @@ class InterpUnit(torch.nn.Module):
                 residuals,
                 source_pos,
                 target_pos,
-                source_kernel_invs=None,
-                sigma=20.0,
-                allow_destroy=False,
-                kind="normalized",
+                source_kernel_invs=source_inv,
+                sigma=self.kriging_sigma,
+                kind=imputation_kind,
             )
+            imputed = torch.where(
+                torch.isfinite(residuals.view(n, -1)),
+                residuals.view(n, -1),
+                recons.view(n, -1),
+            )
+        elif imputation_kind in ("kernel", "normalized"):
+            source_pos = padded_registered_geom[waveform_channels]
+            target_pos = padded_registered_geom[self.channels]
+            # source_pos = source_pos[None].broadcast_to((n, *source_pos.shape))
+            target_pos = target_pos[None].broadcast_to((n, *target_pos.shape))
+            waveforms = kernel_interpolate(
+                waveforms,
+                source_pos,
+                target_pos,
+                sigma=self.kriging_sigma,
+                kind=imputation_kind,
+            )
+            imputed = waveforms.reshape(n, -1)
+            if centered:
+                imputed -= self.mean
         else:
             assert False
-        imputed = torch.where(
-            torch.isfinite(residuals.view(n, -1)),
-            residuals.view(n, -1),
-            recons.view(n, -1),
-        )
-        assert torch.isfinite(imputed).all()
         return imputed
 
     def fit_residual(
@@ -886,6 +929,8 @@ class InterpUnit(torch.nn.Module):
         geom,
         waveform_channel_index,
         show_progress=False,
+        imputation_kind=None,
+        padded_registered_geom=None,
     ):
         rel_ix = self.rel_ix(waveform_channels)
         n = len(times)
@@ -899,18 +944,29 @@ class InterpUnit(torch.nn.Module):
                 padded=False,
             )
         else:
-            waveforms_rel = self.to_unit_channels(
-                waveforms,
-                times,
-                rel_ix=rel_ix,
-                fill_mode="constant",
-                constant_value=0.0 if self.pca_impute_zeros else torch.nan,
-            )
-            residuals = waveforms_rel.reshape(n, -1) - self.mean
-        if self.pca_on_waveform_channels:
-            wfcs = waveform_channel_index[self.max_channel]
-            wfcs = wfcs[None].broadcast_to((len(residuals), *wfcs.shape))
-            residuals = self.to_waveform_channels(residuals, wfcs)
+            if imputation_kind is not None and imputation_kind != "pca":
+                waveforms_rel = self.impute(
+                    times,
+                    waveforms,
+                    waveform_channels,
+                    waveform_channel_index,
+                    imputation_kind=imputation_kind,
+                    padded_registered_geom=padded_registered_geom,
+                )
+                residuals = waveforms_rel.reshape(n, -1) - self.mean
+            else: 
+                waveforms_rel = self.to_unit_channels(
+                    waveforms,
+                    times,
+                    rel_ix=rel_ix,
+                    fill_mode="constant",
+                    constant_value=0.0 if self.pca_impute_zeros else torch.nan,
+                )
+                residuals = waveforms_rel.reshape(n, -1) - self.mean
+                if self.pca_on_waveform_channels:
+                    wfcs = waveform_channel_index[self.max_channel]
+                    wfcs = wfcs[None].broadcast_to((len(residuals), *wfcs.shape))
+                    residuals = self.to_waveform_channels(residuals, wfcs)
         # if self.pca_impute_zeros:
         #     torch.nan_to_num(residuals, out=residuals)
         if self.pca_noise_scale:
@@ -980,6 +1036,7 @@ class InterpClusterer(torch.nn.Module):
         merge_on_waveform_radius=True,
         interp_kind="nearest",
         imputation_kind="pca",
+        impute_before_center=False,
         drift_positions="channel",
         match_threshold=1.0,
         sampling_sigma=0.5,
@@ -1046,6 +1103,8 @@ class InterpClusterer(torch.nn.Module):
             channel_strategy_snr_min=channel_strategy_snr_min,
             channel_strategy_snr_minamp=channel_strategy_snr_minamp,
             kriging_sigma=self.data.kriging_sigma,
+            imputation_kind=imputation_kind,
+            impute_before_center=impute_before_center,
         )
 
         torch.manual_seed(self.rg.bit_generator.random_raw())
@@ -1263,7 +1322,7 @@ class InterpClusterer(torch.nn.Module):
             #     weights = F.softmax(-0.5 * weights, dim=0)
 
             model.fit_center(
-                **train_data, weights=weights, show_progress=False, with_var=with_var
+                **train_data, padded_geom=self.data.padded_registered_geom, weights=weights, show_progress=False, with_var=with_var
             )
             model.fit_indices = None
             if fit_residual:
@@ -1274,7 +1333,12 @@ class InterpClusterer(torch.nn.Module):
                 )
                 if self.channel_strategy != "snr":
                     del train_data["cluster_channel_index"]
-                model.fit_residual(**train_data, show_progress=False)
+                model.fit_residual(
+                    **train_data,
+                    show_progress=False,
+                    imputation_kind=self.imputation_kind,
+                    padded_registered_geom=self.data.padded_registered_geom,
+                )
                 model.fit_indices = in_unit
             return model
 
@@ -1660,7 +1724,7 @@ class InterpClusterer(torch.nn.Module):
                 in_unit=inu,
                 sampling_method=self.sampling_method,
             )
-            u.fit_center(**train_data, show_progress=False, weights=w, **chan_kw)
+            u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom, weights=w, **chan_kw)
             new_units.append(u)
 
         # remove dead units
@@ -1801,7 +1865,7 @@ class InterpClusterer(torch.nn.Module):
                 in_unit=inu,
                 sampling_method=self.sampling_method,
             )
-            u.fit_center(**train_data, show_progress=False)
+            u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom)
             new_units.append(u)
         divergences = self.reassignment_divergences(
             which_spikes=in_unit_full,
@@ -3778,11 +3842,9 @@ def _interp_by_chunk(
         )
 
     source_invs = None
-    if interp_kind == "kriging":
+    if interp_kind.startswith("kriging"):
         source_pos = source_geom[channel_index].to(device)
-        source_kernel = torch.cdist(source_pos, source_pos)
-        source_kernel = source_kernel.square_().mul_(-1.0 / (2 * sigma**2))
-        torch.nan_to_num(source_kernel, nan=-torch.inf, out=source_kernel)
+        source_kernel = log_rbf(source_pos[None])
         source_kernel = source_kernel.exp_()
         source_invs = torch.linalg.pinv(source_kernel)
 
@@ -3824,14 +3886,14 @@ def kernel_interpolate(
 ):
     # geoms should be nan-padded here.
     # build kernel
-    kernel = torch.cdist(source_pos, target_pos)
-    kernel = kernel.square_().mul_(-1.0 / (2 * sigma**2))
-    torch.nan_to_num(kernel, nan=-torch.inf, out=kernel)
+    kernel = log_rbf(source_pos, target_pos, sigma)
     if kind == "normalized":
-        kernel = F.softmax(kernel, dim=2)
-    elif kind == "kriging":
+        kernel = F.softmax(kernel, dim=1)
+    elif kind.startswith("kriging"):
         kernel = kernel.exp_()
         kernel = source_kernel_invs @ kernel
+        if kind == "kriging_normalized":
+            kernel = kernel / kernel.sum(1, keepdim=True)
     elif kind == "kernel":
         kernel = kernel.exp_()
     else:
@@ -3849,6 +3911,16 @@ def kernel_interpolate(
     features[needs_nan] = torch.nan
 
     return features
+
+
+def log_rbf(source_pos, target_pos=None, sigma=None):
+    if target_pos is None:
+        target_pos = source_pos
+    kernel = torch.cdist(source_pos, target_pos)
+    kernel = kernel.square_().mul_(-1.0 / (2 * sigma**2))
+    torch.nan_to_num(kernel, nan=-torch.inf, out=kernel)
+    return kernel
+    
 
 
 def svd_lstsq(AA, BB, tol=1e-5, driver='gesvd'):
