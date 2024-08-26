@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from dartsort.cluster import density, initial
 from dartsort.cluster.modes import smoothed_dipscore_at
 from dartsort.config import ClusteringConfig
-from dartsort.util import data_util, drift_util, spiketorch, waveform_util
+from dartsort.util import data_util, drift_util, waveform_util, spiketorch
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.interpolate import PchipInterpolator
 from scipy.sparse import coo_array, dok_array
@@ -106,30 +106,25 @@ class SpikeData(torch.nn.Module):
         self.amps = amps
         original_static_channels = torch.as_tensor(original_static_channels)
         reassign_static_channels = torch.as_tensor(reassign_static_channels)
+        self.register_buffer("reassign_static_channels", reassign_static_channels)
         if in_memory:
             original_tpca_embeds = torch.as_tensor(original_tpca_embeds)
             reassign_tpca_embeds = torch.as_tensor(reassign_tpca_embeds)
             amp_vecs = torch.as_tensor(amp_vecs)
 
-        # these need to be on the GPU for speed
-        # this could easily become an issue. in that case, they will still be small
-        # enough to fit into ram, and the solution is to implement some kind of chunking
-        # in reassign(). i'm talking huge chunks -- looping over .batch_size is slow.
-        self.register_buffer("reassign_static_channels", reassign_static_channels)
-        self.register_buffer("reassign_tpca_embeds", reassign_tpca_embeds)
-
         if on_device and self.in_memory:
             self.register_buffer("original_tpca_embeds", original_tpca_embeds)
+            self.register_buffer("reassign_tpca_embeds", reassign_tpca_embeds)
             self.register_buffer("original_static_channels", original_static_channels)
             self.register_buffer("amp_vecs", amp_vecs)
         elif pin and self.in_memory and torch.cuda.is_available():
             self.original_tpca_embeds = original_tpca_embeds.pin_memory()
-            # self.reassign_tpca_embeds = reassign_tpca_embeds.pin_memory()
+            self.reassign_tpca_embeds = reassign_tpca_embeds.pin_memory()
             self.original_static_channels = original_static_channels.pin_memory()
             self.amp_vecs = amp_vecs.pin_memory()
         else:
             self.original_tpca_embeds = original_tpca_embeds
-            # self.reassign_tpca_embeds = reassign_tpca_embeds
+            self.reassign_tpca_embeds = reassign_tpca_embeds
             self.original_static_channels = original_static_channels
             self.amp_vecs = amp_vecs
 
@@ -199,7 +194,7 @@ class SpikeData(torch.nn.Module):
             waveforms = torch.from_numpy(waveforms)
 
         if device is not None:
-            waveforms = waveforms.to(device, non_blocking=self.pin)
+            waveforms = waveforms.to(device)  # , non_blocking=self.pin)
         return waveforms
 
     def get_static_amp_vecs(
@@ -2239,28 +2234,8 @@ class InterpClusterer(torch.nn.Module):
             self.labels[in_split] = new_label
         return n_split - 1
 
-    def unit_channel_overlaps(self, units_a=None, units_b=None):
-        units = self.unit_ids()
-        if units_a is None:
-            units_a = units
-        if units_b is None:
-            units_b = units
-        different = not torch.equal(units_a, units_b)
-        masks_a = torch.zeros((len(units_a), len(self.data.registered_geom)))
-        masks_b = masks_a
-        if different:
-            masks_b = torch.zeros((len(units_b), len(self.data.registered_geom)))
-        for j, u in enumerate(units_a):
-            masks_a[j, self[u].channels_valid] = 1.0
-        if different:
-            for j, u in enumerate(units_b):
-                masks_b[j, self[u].channels_valid] = 1.0
-        overlaps = masks_a @ masks_b.T
-        overlaps /= masks_a.sum(1, keepdim=True)  # IoA
-        return overlaps
-
     def central_divergences(
-        self, units_a=None, units_b=None, kind=None, min_overlap=0.1, n_threads=0
+        self, units_a=None, units_b=None, kind=None, min_overlap=None, n_threads=0
     ):
         if kind is None:
             kind = self.merge_metric
@@ -2268,7 +2243,7 @@ class InterpClusterer(torch.nn.Module):
         if self.merge_on_waveform_radius:
             subset_channel_index = self.data.registered_reassign_channel_index
         if min_overlap is None:
-            min_overlap = 1.0 - self.merge_threshold
+            min_overlap = self.min_overlap
         units = self.unit_ids()
         if units_a is None:
             units_a = units
@@ -2277,14 +2252,10 @@ class InterpClusterer(torch.nn.Module):
         nua = len(units_a)
         nub = len(units_b)
         divergences = torch.full((nua, nub), torch.inf)
-        divergences.diagonal().fill_(0.0)
-        overlaps = self.unit_channel_overlaps(units_a, units_b).numpy(force=True)
-        valid_pairs = [np.flatnonzero((o >= min_overlap) & (o > 0)) for o in overlaps]
 
         if not n_threads:
             for i, ua in enumerate(units_a):
-                for j in valid_pairs[i]:
-                    ub = units_b[j]
+                for j, ub in enumerate(units_b):
                     if ua == ub:
                         divergences[i, j] = 0
                         continue
@@ -2300,8 +2271,7 @@ class InterpClusterer(torch.nn.Module):
 
         def job(i, ua):
             ca = self[ua].channels_valid
-            for j in valid_pairs[i]:
-                ub = units_b[j]
+            for j, ub in enumerate(units_b):
                 if ua == ub:
                     divergences[i, j] = 0
                     continue
@@ -2413,7 +2383,7 @@ class InterpClusterer(torch.nn.Module):
     def merge(self, n_threads=0):
         merge_dists = self.central_divergences(
             kind=self.merge_metric,
-            # min_overlap=self.min_overlap,
+            min_overlap=self.min_overlap,
             n_threads=n_threads,
         )
         merge_dists = self.merge_sym_function(merge_dists, merge_dists.T)
@@ -2441,89 +2411,6 @@ class InterpClusterer(torch.nn.Module):
             torch.from_numpy(new_labels).to(self.labels),
         )
         self.order_by_depth()
-
-    def all_reassignment_divergences(
-        self,
-        show_progress=True,
-        kind=None,
-        n_threads=1,
-        exclude_above=None,
-    ):
-        if kind is None:
-            kind = self.reassign_metric
-
-        inds_units = [(j, self[uid]) for j, uid in enumerate(self.unit_ids())]
-        pool = joblib.Parallel(n_threads, backend="threading", return_as="generator")
-        n_batches = int(np.ceil(self.data.n_spikes / self.batch_size))
-
-        @joblib.delayed
-        def job(j, unit, sl, times, waveforms, waveform_channels):
-            overlaps, rel_ix = unit.overlaps(waveform_channels)
-            (which,) = torch.nonzero(overlaps >= self.min_overlap, as_tuple=True)
-            if not which.numel():
-                return None, None, None
-
-            overlaps = overlaps[which]
-            rel_ix = rel_ix[which]
-            _, _, badnesses = unit.spike_badnesses(
-                times=times[which],
-                waveforms=waveforms[which],
-                waveform_channels=waveform_channels[which],
-                overlaps=overlaps,
-                rel_ix=rel_ix,
-                kinds=(kind,),
-            )
-            badnesses = badnesses[kind]
-
-            keep = slice(None)
-            if exclude_above is not None:
-                (keep,) = torch.nonzero(badnesses <= exclude_above, as_tuple=True)
-                if not keep.size:
-                    return None, None, None
-
-            return j, sl.start + which[keep].numpy(force=True), badnesses[keep].numpy(force=True)
-
-        ii = []
-        jj = []
-        values = []
-        import itertools
-        jobs = self.all_batches(waveform_kind="reassign")
-        jobs = itertools.product(jobs, inds_units)
-        # for sl, data in tqdm(self.all_batches(waveform_kind="reassign"), desc="Reassign batches", total=n_batches):
-        #     for j, which, results in pool(job(*ju, sl, **data) for ju in inds_units):
-        jobs = pool(
-            job(*ju, sl, **data) for (sl, data), ju in jobs
-        )
-        jobs = tqdm(jobs, desc="Reassign", total=n_batches * len(inds_units))
-        for j, which, results in jobs:
-            ii.append(np.broadcast_to(np.array([j]), which.shape))
-            jj.append(which)
-            values.append(results)
-
-        me = threading.get_ident()
-        need_alloc = me not in self._reas_bufs
-        nout = sum(v.size for v in values)
-        if not need_alloc:
-            if nout > self._reas_bufs[me][0].size:
-                need_alloc = True
-                del self._reas_bufs[me]
-        if need_alloc:
-            nalloc = int(np.ceil(nout * 1.25))
-            vout = np.empty(nalloc, dtype=dtype)
-            iiout = np.empty(nalloc, dtype=np.int32)
-            jjout = np.empty(nalloc, dtype=np.int32)
-            self._reas_bufs[me] = vout, iiout, jjout
-        vout, iiout, jjout = self._reas_bufs[me]
-        if nout:
-            values = np.concatenate(values, out=vout[:nout])
-            ii = np.concatenate(ii, out=iiout[:nout])
-            jj = np.concatenate(jj, out=jjout[:nout])
-            divergences = coo_array((values, (ii, jj)), dtype=dtype, shape=shape)
-        else:
-            divergences = coo_array(shape, dtype=dtype)
-
-        return divergences
-
 
     def reassignment_divergences(
         self,
@@ -2802,9 +2689,9 @@ class InterpClusterer(torch.nn.Module):
     ):
         in_unit = self.get_indices(unit_id, n=n, in_unit=in_unit)
         train_data = self.spike_data(in_unit, waveform_kind=waveform_kind)
-        train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
-            in_unit, device=self.device
-        )
+        # train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
+            # in_unit, device=self.device
+        # )
         train_data["geom"] = self.data.registered_geom
         if self.channel_strategy != "snr":
             train_data["cluster_channel_index"] = self.data.cluster_channel_index
@@ -2836,13 +2723,6 @@ class InterpClusterer(torch.nn.Module):
             waveforms=waveforms,
             waveform_channels=ssc,
         )
-
-    def all_batches(self, waveform_kind="original", batch_size=None):
-        if batch_size is None:
-            batch_size = self.batch_size
-        for j in range(0, self.data.n_spikes, batch_size):
-            sl = slice(j, min(j + batch_size, self.data.n_spikes))
-            yield sl, self.spike_data(sl, waveform_kind=waveform_kind)
 
     def batches(self, indices, batch_size=None, waveform_kind="original"):
         if batch_size is None:
