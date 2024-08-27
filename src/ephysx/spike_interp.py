@@ -2638,14 +2638,29 @@ class InterpClusterer(torch.nn.Module):
         return weights
 
     def reassign(
-        self, n_threads=0, show_progress=True, verbose=True, return_divergences=False
+        self, n_threads=0, show_progress=True, verbose=True, return_divergences=False, drop_dups=False
     ):
         divergences = self.reassignment_divergences(
             n_threads=n_threads,
             exclude_above=self.match_threshold,
             show_progress=show_progress,
         )
-        new_labels = sparse_reassign(divergences, None)
+        divergences_csc, new_labels = sparse_reassign(divergences, None, return_csc=True)
+
+        if drop_dups:
+            print("drop dups!")
+            for unit_id in np.unique(new_labels):
+                in_unit = np.flatnonzero(new_labels == unit_id)
+                my_times = self.data.times_samples[in_unit]
+                unique_times, counts = np.unique(my_times, return_counts=True)
+                viol = np.flatnonzero(counts > 0)
+                if not viol.size:
+                    continue
+                for j in viol:
+                    bad_ix = in_unit[my_times == unique_times[j]]
+                    divs = divergences_csc[np.full_like(bad_ix, unit_id), bad_ix]
+                    best_of_the_bad = divs.min()
+                    new_labels[bad_ix[divs > best_of_the_bad]] = -1
 
         outlier_pct = 100 * (new_labels < 0).mean()
         if verbose:
@@ -4098,7 +4113,7 @@ def mad(x, axis=None, keepdims=False):
     return np.median(x, axis=axis, keepdims=keepdims)
 
 
-def sparse_reassign(divergences, match_threshold=None, batch_size=512):
+def sparse_reassign(divergences, match_threshold=None, batch_size=512, return_csc=False):
     # this uses CSC-specific tricks to do fast argmax per column
     if not divergences.nnz:
         return np.full(divergences.shape[0], -1)
@@ -4106,12 +4121,16 @@ def sparse_reassign(divergences, match_threshold=None, batch_size=512):
     # see scipy csc argmin/argmax for reference here. this is just numba-ing
     # a special case of that code which has a python hot loop.
     divergences = divergences.tocsc()
+    errs = divergences # if match_threshold is None else divergences.copy()
     nz_lines = np.flatnonzero(np.diff(divergences.indptr))
-    errs = divergences if match_threshold is None else divergences.copy()
-    errs.data -= errs.data.max() + 1
+    offset = errs.data.max() + 1
+    errs.data -= offset
     assignments = np.full(errs.shape[1], -1)
     hot_argmin_loop(assignments, nz_lines, errs.indptr, errs.data, errs.indices)
+    errs.data += offset
     if match_threshold is None:
+        if return_csc:
+            return errs, assignments
         return assignments
 
     # we want sparse 0s to mean infinite err, and divs>thresh
@@ -4120,6 +4139,8 @@ def sparse_reassign(divergences, match_threshold=None, batch_size=512):
     outlandish = divergences[assignments[nz_lines], nz_lines] >= match_threshold
     assignments[nz_lines[outlandish]] = -1
 
+    if return_csc:
+        return errs, assignments
     return assignments
 
 
