@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from dartsort.cluster import density, initial
 from dartsort.cluster.modes import smoothed_dipscore_at
 from dartsort.config import ClusteringConfig
-from dartsort.util import data_util, drift_util, waveform_util
+from dartsort.util import data_util, drift_util, waveform_util, spiketorch
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.interpolate import PchipInterpolator
 from scipy.sparse import coo_array, dok_array
@@ -269,6 +269,7 @@ class InterpUnit(torch.nn.Module):
         impute_before_center=False,
         kriging_sigma=None,
         batch_size=16384,
+        impute_batch_size=256,
         pca_on_waveform_channels=True,
         scale_residual_embed=False,
     ):
@@ -291,6 +292,7 @@ class InterpUnit(torch.nn.Module):
         self.imputation_kind = imputation_kind
         self.impute_before_center = impute_before_center
         self.kriging_sigma = kriging_sigma
+        self.impute_batch_size = impute_batch_size
 
         pca_centered = True
         if self.do_interp:
@@ -333,8 +335,9 @@ class InterpUnit(torch.nn.Module):
 
     def determine_position_(
         self,
-        static_amp_vecs,
-        geom,
+        waveforms,
+        waveform_channels,
+        padded_geom,
         cluster_channel_index,
         channels=None,
         max_channel=None,
@@ -342,10 +345,18 @@ class InterpUnit(torch.nn.Module):
         if cluster_channel_index is not None:
             assert cluster_channel_index.shape == (self.n_chans_full, self.n_chans_unit)
 
-        device = static_amp_vecs.device
+        device = waveforms.device
         if channels is None:
-            count = torch.isfinite(static_amp_vecs).sum(0)
-            ampmean = torch.nan_to_num(torch.nanmean(static_amp_vecs, dim=0))
+            geom = padded_geom[:-1]
+            norms = torch.linalg.norm(waveforms, dim=1)
+            ones = torch.isfinite(norms).to(norms)
+            (valid_ix,) = torch.nonzero(ones.view(-1), as_tuple=True)
+            padded_count = torch.zeros(len(padded_geom), device=norms.device)
+            spiketorch.add_at_(padded_count, waveform_channels.view(-1), ones.view(-1))
+            padded_ampmean = torch.zeros(len(padded_geom), device=norms.device)
+            spiketorch.reduce_at_(padded_ampmean, waveform_channels.view(-1)[valid_ix], norms.view(-1)[valid_ix], reduce="mean", include_self=False)
+            count = padded_count[:-1]
+            ampmean = padded_ampmean[:-1]
             snr = ampmean * torch.sqrt(count)
             self.snr = snr
             self.count = count
@@ -531,7 +542,7 @@ class InterpUnit(torch.nn.Module):
             sl = slice(j, min(j + batch_size, n))
             means_rel = self.get_means(times[sl], padded=True)
             if fill_mode == "mean":
-                fill_kw = dict(fill_mode=means_rel.clone())
+                fill_kw = dict(fill_mode=means_rel.clone().detach())
             else:
                 fill_kw = dict(fill_mode=fill_mode, constant_value=constant_value)
             resids = self.to_unit_channels(
@@ -758,7 +769,6 @@ class InterpUnit(torch.nn.Module):
         times,
         waveforms,
         waveform_channels,
-        static_amp_vecs,
         geom,
         padded_geom=None,
         cluster_channel_index=None,
@@ -772,8 +782,9 @@ class InterpUnit(torch.nn.Module):
         # transfer waveform -> unit channels, filling with nans
         self.train()
         self.determine_position_(
-            static_amp_vecs,
-            geom,
+            waveforms,
+            waveform_channels,
+            padded_geom,
             cluster_channel_index,
             channels=channels,
             max_channel=max_channel,
@@ -815,13 +826,22 @@ class InterpUnit(torch.nn.Module):
             weights = weights / weights.sum()
             mean = torch.nansum(weights[:, None] * waveforms_rel.reshape(n, -1), dim=0)
             mean = torch.nan_to_num(mean)
-
-            self.register_buffer(
-                "mean",
-                mean,
-                # torch.nan_to_num(torch.nanmedian(waveforms_rel.reshape(n, -1), dim=0).values),
-                # torch.nan_to_num(torch.nanmean(waveforms_rel.reshape(n, -1), dim=0)),
-            )
+            if mean.abs().max() > 1000:
+                print(f"{torch.nan_to_num(waveforms).min()=} {torch.nan_to_num(waveforms).max()=}")
+                print(f"{waveforms_rel.min()=} {waveforms_rel.max()=}")
+                print(f"{mean.min()=} {mean.max()=}")
+                print(f"{weights.min()=} {weights.max()=}")
+                print(f"{waveforms.shape=} {waveforms_rel.shape=}")
+                print("!!!!!")
+                print(f"{padded_geom[self.channels]=}")
+                raise ValueError("gah")
+            if hasattr(self, "mean"):
+                self.mean.copy_(mean)
+            else:
+                self.register_buffer(
+                    "mean",
+                    mean,
+                )
             if with_var:
                 dxsq = (waveforms_rel.reshape(n, -1) - self.mean).square_()
                 var = torch.nansum(weights[:, None] * dxsq, dim=0)
@@ -838,7 +858,13 @@ class InterpUnit(torch.nn.Module):
                 var = torch.square(cov * norm_mean)
 
                 # var = 1.0 + F.softplus(var - 1.0)
-                self.register_buffer("var", var)
+                if hasattr(self, "var"):
+                    self.var.copy_(var)
+                else:
+                    self.register_buffer(
+                        "var",
+                        var,
+                    )
 
     def impute(
         self,
@@ -849,6 +875,7 @@ class InterpUnit(torch.nn.Module):
         imputation_kind=None,
         padded_registered_geom=None,
         centered=True,
+        valid_only=False,
     ):
         n = len(times)
         imputation_kind = self.imputation_kind
@@ -876,6 +903,7 @@ class InterpUnit(torch.nn.Module):
                 recons.view(n, -1),
             )
         elif imputation_kind.startswith("kriging"):
+            assert not valid_only
             residuals = residuals.view((n, self.waveform_rank, -1))
             assert not self.pca_on_waveform_channels, "Could support this with target kernel"
             source_pos = padded_registered_geom[self.channels]
@@ -902,18 +930,23 @@ class InterpUnit(torch.nn.Module):
                 recons.view(n, -1),
             )
         elif imputation_kind in ("kernel", "normalized"):
-            source_pos = padded_registered_geom[waveform_channels]
-            target_pos = padded_registered_geom[self.channels]
+            # source_pos = padded_registered_geom[waveform_channels]
+            c = self.channels_valid if valid_only else self.channels
+            target_pos = padded_registered_geom[c]
             # source_pos = source_pos[None].broadcast_to((n, *source_pos.shape))
             target_pos = target_pos[None].broadcast_to((n, *target_pos.shape))
-            waveforms = kernel_interpolate(
-                waveforms,
-                source_pos,
-                target_pos,
-                sigma=self.kriging_sigma,
-                kind=imputation_kind,
-            )
-            imputed = waveforms.reshape(n, -1)
+            imputed = torch.empty((*waveforms.shape[:2], c.numel()), dtype=waveforms.dtype, device=waveforms.device)
+            for j in range(0, n, self.impute_batch_size):
+                sl = slice(j, j + self.impute_batch_size)
+                kernel_interpolate(
+                    waveforms[sl],
+                    padded_registered_geom[waveform_channels[sl]],
+                    target_pos[sl],
+                    sigma=self.kriging_sigma,
+                    kind=imputation_kind,
+                    out=imputed[sl],
+                )
+            imputed = imputed.reshape(n, -1)
             if centered:
                 imputed -= self.mean
         else:
@@ -925,7 +958,6 @@ class InterpUnit(torch.nn.Module):
         times,
         waveforms,
         waveform_channels,
-        static_amp_vecs,
         geom,
         waveform_channel_index,
         show_progress=False,
@@ -1254,7 +1286,7 @@ class InterpClusterer(torch.nn.Module):
 
     def m_step(
         self,
-        force=False,
+        force=True,
         to_fit=None,
         fit_residual=True,
         show_progress=True,
@@ -1285,7 +1317,7 @@ class InterpClusterer(torch.nn.Module):
             )
 
         def fit_unit(j, uid):
-            if uid not in self:
+            if force or uid not in self:
                 model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
                 model.to(self.device)
                 if store:
@@ -1621,7 +1653,7 @@ class InterpClusterer(torch.nn.Module):
         n_clust=5,
         n_iter=0,
         seed_with="mean",
-        drop_prop=0.05,
+        drop_prop=0.02,
     ):
         in_unit, data = self.get_training_data(
             unit_id,
@@ -1638,6 +1670,7 @@ class InterpClusterer(torch.nn.Module):
             data["waveform_channel_index"],
             imputation_kind=self.imputation_kind,
             padded_registered_geom=self.data.padded_registered_geom,
+            valid_only=True,
         )
 
         # pick centroids and reassign imputed wfs
@@ -1647,6 +1680,7 @@ class InterpClusterer(torch.nn.Module):
             (n,), torch.inf, dtype=waveforms.dtype, device=waveforms.device
         )
         assignments = torch.zeros((n,), dtype=torch.long, device=self.labels.device)
+        err_info = f"{n=} {waveforms.shape=}"
         for j in range(n_clust):
             if j == 0:
                 if seed_with == "random":
@@ -1663,7 +1697,24 @@ class InterpClusterer(torch.nn.Module):
                 else:
                     assert False
             else:
-                newix = self.rg.choice(n, p=(dists / dists.sum()).numpy(force=True))
+                p = torch.nan_to_num(dists)
+                p = p / p.sum()
+                p = p.numpy(force=True)
+                if not np.isclose(p.sum(), 1.0):
+                    print(f"bad {p.sum()=}")
+                    print(f"{j=}")
+                    print(f"{dists=} {dists.min()=} {dists.max()=}")
+                    print(f"{dists.shape=} {dists[:5]=}")
+                    print(f"{waveforms[0]=}")
+                    print(f"{centroid_ixs=}")
+                    print(f"{waveforms[centroid_ixs]=}")
+                    print(f"{torch.isnan(waveforms).to(torch.float).mean()=}")
+                    print(f"{torch.isinf(waveforms).to(torch.float).mean()=}")
+                    print(f"{torch.isnan(waveforms[centroid_ixs]).to(torch.float).mean()=}")
+                    print(f"{torch.isinf(waveforms[centroid_ixs]).to(torch.float).mean()=}")
+                    print(err_info)
+                    p = np.full_like(p, 1.0 / p.size)
+                newix = self.rg.choice(n, p=p)
             centroid_ixs.append(newix)
             curcent = waveforms[newix][None]
             newdists = (waveforms - curcent).square_().sum(1)
@@ -1675,23 +1726,52 @@ class InterpClusterer(torch.nn.Module):
         if n_iter:
             # e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
             # centroids = (e / e.sum(0)).T @ waveforms
-            centroids = waveforms[centroid_ixs]
-            dists = waveforms[:, None, :] - centroids[None, :, :]
-            dists = dists.square_().sum(2)
-            for i in range(n_iter):
-                # update responsibilities, n x k
-                e = F.softmax(-0.5 * dists, dim=1)
+            try:
+                for i in range(n_iter):
+                    # update responsibilities, n x k
+                    err_str = ""
+                    e = F.softmax(-0.5 * dists, dim=1)
+                    err_str += "\n" + (f"{i=} aa {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                    err_str += "\n" + (f"{i=} ab {e.shape=} {e.sum(0)=} {e.mean(0)=}")
 
-                # delete too-small centroids
-                if drop_prop is not None:
-                    e = e[:, e.sum(0) >= drop_prop * n]
+                    # delete too-small centroids
+                    err_str += "\n" + (f"{i=} ba {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                    if drop_prop is not None:
+                        e = e[:, e.mean(0) >= drop_prop]
+                    err_str += "\n" + (f"{i=} bb {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                    e = e.div_(e.sum(0))
+                    err_str += "\n" + (f"{i=} bc {e.shape=} {e.sum(0)=} {e.mean(0)=}")
 
-                # update centroids
-                e = e.div_(e.sum(0))
-                centroids = e.T @ waveforms
-                dists = waveforms[:, None, :] - centroids[None, :, :]
-                dists = dists.square_().sum(2)
-                assignments = torch.argmin(dists, 1)
+                    # update centroids
+                    centroids = e.T @ waveforms
+                    err_str += "\n" + (f"{i=} {centroids.shape=}")
+                    dists = waveforms[:, None, :] - centroids[None, :, :]
+                    err_str += "\n" + (f"{i=} {dists.shape=}")
+                    dists = dists.square_().sum(2)
+                    err_str += "\n" + (f"{i=} {dists.shape=}")
+                    assignments = torch.argmin(dists, 1)
+                    if e.shape[1] == 1:
+                        break
+            except:
+                print()
+                print(f"{torch.isnan(waveforms).to(torch.float).mean()=}")
+                print(f"{torch.isinf(waveforms).to(torch.float).mean()=}")
+                centroids = waveforms[centroid_ixs]
+                print(f"{torch.isnan(centroids).to(torch.float).mean()=}")
+                print(f"{torch.isinf(centroids).to(torch.float).mean()=}")
+                print(f"{centroids=}")
+                print(f"{centroids.min()=}")
+                print(f"{centroids.max()=}")
+                print(f"{waveforms.min()=}")
+                print(f"{waveforms.max()=}")
+                print(f"{waveforms[10]=}")
+                print(f"{waveforms[22]=}")
+                print(f"{waveforms.shape=} {centroids.shape=}")
+                dists = torch.cdist(waveforms[None], centroids[None])[0]
+                print(f"yy {dists=} {torch.isnan(dists).any()=} {torch.isinf(dists.any())=}")
+                print(f"{dists.shape=} {dists.min()=} {dists.max()=}")
+                print(err_str)
+                raise
 
         return in_unit, assignments.to(in_unit), e
 
@@ -1772,6 +1852,7 @@ class InterpClusterer(torch.nn.Module):
         return labels
 
     def kmeans_split(self, verbose=False, n_threads=0):
+        assert n_threads == 0, "Need to lock rng access"
         n_new = 0
         threaded = bool(n_threads)
         if not threaded:
@@ -2608,9 +2689,9 @@ class InterpClusterer(torch.nn.Module):
     ):
         in_unit = self.get_indices(unit_id, n=n, in_unit=in_unit)
         train_data = self.spike_data(in_unit, waveform_kind=waveform_kind)
-        train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
-            in_unit, device=self.device
-        )
+        # train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
+            # in_unit, device=self.device
+        # )
         train_data["geom"] = self.data.registered_geom
         if self.channel_strategy != "snr":
             train_data["cluster_channel_index"] = self.data.cluster_channel_index
@@ -3883,6 +3964,7 @@ def kernel_interpolate(
     sigma=20.0,
     allow_destroy=False,
     kind="normalized",
+    out=None,
 ):
     # geoms should be nan-padded here.
     # build kernel
@@ -3901,9 +3983,12 @@ def kernel_interpolate(
     torch.nan_to_num(kernel, out=kernel)
 
     # and apply...
-    n, rank = features.shape[:2]
     features = torch.nan_to_num(features, out=features if allow_destroy else None)
-    features = torch.bmm(features, kernel)
+    err_str = f"before {features.min()=} {features.max()=}"
+    features = torch.bmm(features, kernel, out=out)
+    if features.abs().max() > 1000:
+        err_str += "\nfafter {features.min()=} {features.max()=}"
+        raise ValueError(err_str)
 
     # nan-ify nonexistent chans
     needs_nan = torch.isnan(target_pos).all(2).unsqueeze(1)
@@ -3920,7 +4005,6 @@ def log_rbf(source_pos, target_pos=None, sigma=None):
     kernel = kernel.square_().mul_(-1.0 / (2 * sigma**2))
     torch.nan_to_num(kernel, nan=-torch.inf, out=kernel)
     return kernel
-    
 
 
 def svd_lstsq(AA, BB, tol=1e-5, driver='gesvd'):
