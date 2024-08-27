@@ -2814,9 +2814,6 @@ class InterpClusterer(torch.nn.Module):
     ):
         in_unit = self.get_indices(unit_id, n=n, in_unit=in_unit)
         train_data = self.spike_data(in_unit, waveform_kind=waveform_kind)
-        # train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
-        #     in_unit, device=self.device
-        # )
         train_data["geom"] = self.data.registered_geom
         if self.channel_strategy != "snr":
             train_data["cluster_channel_index"] = self.data.cluster_channel_index
