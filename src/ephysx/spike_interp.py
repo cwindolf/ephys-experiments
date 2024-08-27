@@ -794,6 +794,8 @@ class InterpUnit(torch.nn.Module):
             channels=channels,
             max_channel=max_channel,
         )
+        if not self.n_chans_unit:
+            raise ValueError("Low-signal unit.")
         self._init_models()
         self.to(waveforms.device)
         n = len(times)
@@ -1047,7 +1049,7 @@ class InterpClusterer(torch.nn.Module):
         residual_pca_rank=2,
         min_cluster_size=50,
         n_spikes_fit=2048,
-        do_interp=True,
+        do_interp=False,
         fa_kwargs=default_fa_kwargs,
         residual_pca_kwargs=default_residual_pca_kwargs,
         scale_residual_embed=False,
@@ -1194,19 +1196,8 @@ class InterpClusterer(torch.nn.Module):
         return ix in self.models
 
     def unit_ids(self):
-        """Get the current set of unit ids
-
-        This is actually kinda hard. Because we sometimes have units with models but no spikes.
-        And we sometimes have not instantiated models yet.
-        """
         ids = torch.unique(self.labels)
         ids = ids[ids >= 0]
-        assert torch.equal(ids, torch.arange(ids.numel()))
-
-        model_ids = torch.tensor([int(uid) for uid in self.models.keys()])
-        model_ids = model_ids.to(ids)
-        ids = torch.unique(torch.concatenate((ids, model_ids)))
-
         return ids
 
     @property
@@ -1321,6 +1312,9 @@ class InterpClusterer(torch.nn.Module):
                 divergences=divergences,
             )
 
+        if force:
+            self.models.clear()
+
         def fit_unit(j, uid):
             if force or uid not in self:
                 model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
@@ -1345,22 +1339,17 @@ class InterpClusterer(torch.nn.Module):
                     .to_dense()
                     .to(train_data["waveforms"])
                 )
-            # elif weights_kind is not None:
-            #     badness = self.reassignment_divergences(
-            #         which_spikes=in_unit,
-            #         units=[model],
-            #         show_progress=False,
-            #         kind=weights_kind,
-            #     )
-            #     weights = np.full(in_unit.shape, np.inf)
-            #     weights[badness.coords[1]] = badness.data
-            #     # weights = torch.from_numpy(np.reciprocal(weights)).to(train_data['waveforms'])
-            #     weights = torch.from_numpy(weights).to(train_data['waveforms'])
-            #     weights = F.softmax(-0.5 * weights, dim=0)
 
-            model.fit_center(
-                **train_data, padded_geom=self.data.padded_registered_geom, weights=weights, show_progress=False, with_var=with_var
-            )
+            try:
+                model.fit_center(
+                    **train_data, padded_geom=self.data.padded_registered_geom, weights=weights, show_progress=False, with_var=with_var
+                )
+            except ValueError:
+                with self.labels_lock:
+                    self.labels[self.labels == uid] = -1
+                    if store:
+                        del self.models[self.normalize_key(uid)]
+                    return
             model.fit_indices = None
             if fit_residual:
                 in_unit, train_data = self.get_training_data(
@@ -1387,7 +1376,8 @@ class InterpClusterer(torch.nn.Module):
             if show_progress:
                 res = tqdm(res, desc="M step", total=len(to_fit), **tqdm_kw)
             for model in res:
-                fit_units.append(model)
+                if model is not None:
+                    fit_units.append(model)
         else:
             if show_progress:
                 to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
@@ -1729,54 +1719,56 @@ class InterpClusterer(torch.nn.Module):
 
         e = None
         if n_iter:
-            # e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
-            # centroids = (e / e.sum(0)).T @ waveforms
-            try:
-                for i in range(n_iter):
-                    # update responsibilities, n x k
-                    err_str = ""
-                    e = F.softmax(-0.5 * dists, dim=1)
-                    err_str += "\n" + (f"{i=} aa {e.shape=} {e.sum(0)=} {e.mean(0)=}")
-                    err_str += "\n" + (f"{i=} ab {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+            e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
+            centroids = (e / e.sum(0)).T @ waveforms
+            dists = torch.cdist(waveforms, centroids).square_()
+            # try:
+            for i in range(n_iter):
+                # update responsibilities, n x k
+                # err_str = ""
+                e = F.softmax(-0.5 * dists, dim=1)
+                # err_str += "\n" + (f"{i=} aa {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                # err_str += "\n" + (f"{i=} ab {e.shape=} {e.sum(0)=} {e.mean(0)=}")
 
-                    # delete too-small centroids
-                    err_str += "\n" + (f"{i=} ba {e.shape=} {e.sum(0)=} {e.mean(0)=}")
-                    if drop_prop is not None:
-                        e = e[:, e.mean(0) >= drop_prop]
-                    err_str += "\n" + (f"{i=} bb {e.shape=} {e.sum(0)=} {e.mean(0)=}")
-                    e = e.div_(e.sum(0))
-                    err_str += "\n" + (f"{i=} bc {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                # delete too-small centroids
+                # err_str += "\n" + (f"{i=} ba {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                if drop_prop is not None:
+                    e = e[:, e.mean(0) >= drop_prop]
+                # err_str += "\n" + (f"{i=} bb {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                e = e.div_(e.sum(0))
+                # err_str += "\n" + (f"{i=} bc {e.shape=} {e.sum(0)=} {e.mean(0)=}")
 
-                    # update centroids
-                    centroids = e.T @ waveforms
-                    err_str += "\n" + (f"{i=} {centroids.shape=}")
-                    dists = waveforms[:, None, :] - centroids[None, :, :]
-                    err_str += "\n" + (f"{i=} {dists.shape=}")
-                    dists = dists.square_().sum(2)
-                    err_str += "\n" + (f"{i=} {dists.shape=}")
-                    assignments = torch.argmin(dists, 1)
-                    if e.shape[1] == 1:
-                        break
-            except:
-                print()
-                print(f"{torch.isnan(waveforms).to(torch.float).mean()=}")
-                print(f"{torch.isinf(waveforms).to(torch.float).mean()=}")
-                centroids = waveforms[centroid_ixs]
-                print(f"{torch.isnan(centroids).to(torch.float).mean()=}")
-                print(f"{torch.isinf(centroids).to(torch.float).mean()=}")
-                print(f"{centroids=}")
-                print(f"{centroids.min()=}")
-                print(f"{centroids.max()=}")
-                print(f"{waveforms.min()=}")
-                print(f"{waveforms.max()=}")
-                print(f"{waveforms[10]=}")
-                print(f"{waveforms[22]=}")
-                print(f"{waveforms.shape=} {centroids.shape=}")
-                dists = torch.cdist(waveforms[None], centroids[None])[0]
-                print(f"yy {dists=} {torch.isnan(dists).any()=} {torch.isinf(dists.any())=}")
-                print(f"{dists.shape=} {dists.min()=} {dists.max()=}")
-                print(err_str)
-                raise
+                # update centroids
+                centroids = e.T @ waveforms
+                # err_str += "\n" + (f"{i=} {centroids.shape=}")
+                # dists = waveforms[:, None, :] - centroids[None, :, :]
+                # err_str += "\n" + (f"{i=} {dists.shape=}")
+                # dists = dists.square_().sum(2)
+                dists = torch.cdist(waveforms, centroids).square_()
+                # err_str += "\n" + (f"{i=} {dists.shape=}")
+                assignments = torch.argmin(dists, 1)
+                if e.shape[1] == 1:
+                    break
+            # except:
+            #     print()
+            #     print(f"{torch.isnan(waveforms).to(torch.float).mean()=}")
+            #     print(f"{torch.isinf(waveforms).to(torch.float).mean()=}")
+            #     centroids = waveforms[centroid_ixs]
+            #     print(f"{torch.isnan(centroids).to(torch.float).mean()=}")
+            #     print(f"{torch.isinf(centroids).to(torch.float).mean()=}")
+            #     print(f"{centroids=}")
+            #     print(f"{centroids.min()=}")
+            #     print(f"{centroids.max()=}")
+            #     print(f"{waveforms.min()=}")
+            #     print(f"{waveforms.max()=}")
+            #     print(f"{waveforms[10]=}")
+            #     print(f"{waveforms[22]=}")
+            #     print(f"{waveforms.shape=} {centroids.shape=}")
+            #     dists = torch.cdist(waveforms[None], centroids[None])[0]
+            #     print(f"yy {dists=} {torch.isnan(dists).any()=} {torch.isinf(dists.any())=}")
+            #     print(f"{dists.shape=} {dists.min()=} {dists.max()=}")
+            #     print(err_str)
+            #     raise
 
         return in_unit, assignments.to(in_unit), e
 
@@ -1794,6 +1786,8 @@ class InterpClusterer(torch.nn.Module):
                 channels=self[unit_id].channels,
                 max_channel=self[unit_id].max_channel,
             )
+        alive_labels = np.full_like(sub_labels, -1)
+        cur_ix = 0
         for j, label in enumerate(ids):
             u = InterpUnit(
                 do_interp=False,
@@ -1809,12 +1803,15 @@ class InterpClusterer(torch.nn.Module):
                 in_unit=inu,
                 sampling_method=self.sampling_method,
             )
-            u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom, weights=w, **chan_kw)
-            new_units.append(u)
+            try:
+                u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom, weights=w, **chan_kw)
+                new_units.append(u)
+                alive_labels[sub_labels == label] = cur_ix
+                cur_ix += 1
+            except ValueError:
+                continue
 
-        # remove dead units
-        is_alive = np.array([bool(u.n_chans_unit) for u in new_units])
-        is_alive = is_alive[sub_labels]
+        # this is alive_label, unit pair
         ju = [(j, u) for j, u in enumerate(new_units) if u.n_chans_unit]
 
         # sub-merge
@@ -1847,10 +1844,10 @@ class InterpClusterer(torch.nn.Module):
         new_labels = fcluster(Z, self.zip_threshold, criterion="distance")
         new_labels -= 1
 
-        _, merge_labels = np.unique(new_labels[sub_labels], return_inverse=True)
+        _, merge_labels = np.unique(new_labels[alive_labels], return_inverse=True)
 
         labels = np.where(
-            is_alive,
+            alive_labels >= 0,
             merge_labels,
             -1,
         )
@@ -2817,9 +2814,9 @@ class InterpClusterer(torch.nn.Module):
     ):
         in_unit = self.get_indices(unit_id, n=n, in_unit=in_unit)
         train_data = self.spike_data(in_unit, waveform_kind=waveform_kind)
-        train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
-            in_unit, device=self.device
-        )
+        # train_data["static_amp_vecs"] = self.data.get_static_amp_vecs(
+        #     in_unit, device=self.device
+        # )
         train_data["geom"] = self.data.registered_geom
         if self.channel_strategy != "snr":
             train_data["cluster_channel_index"] = self.data.cluster_channel_index
