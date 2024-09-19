@@ -19,6 +19,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.interpolate import PchipInterpolator
 from scipy.sparse import coo_array, dok_array
 from scipy.spatial import KDTree
+from scipy.stats import pearsonr
 from sklearn.gaussian_process.kernels import RBF
 
 tqdm_kw = dict(smoothing=0, mininterval=1 / 24)
@@ -78,6 +79,8 @@ class SpikeData(torch.nn.Module):
         on_device: bool = False,
         tpca: Optional["TemporalPCAFeaturizer"] = None,
         kriging_sigma: Optional[float] = None,
+        global_var=None,
+        global_ptp=None,
     ):
         super().__init__()
         self.n_chans_full = n_chans_full
@@ -100,6 +103,20 @@ class SpikeData(torch.nn.Module):
         self.original_channel_index = original_channel_index
         self.reassign_channel_index = reassign_channel_index
         self.static_main_channels = torch.as_tensor(static_main_channels)
+        self.global_var = torch.as_tensor(global_var)
+        self.global_ptp = torch.as_tensor(global_ptp)
+        # \sum_reas chans \sum_rank log(1/ptp) = n_reas_chans * \sum_rank [-log(ptp)]
+
+        # uniform...
+        # self.noise_log_likelihood = self.global_ptp.log().neg().sum() * self.n_chans_reassign
+
+        # better explained by xsigma of a global noise gaussian
+        noise_sigma = 0.5
+        self.noise_log_likelihood = self.n_chans_reassign * (
+            -0.5 * noise_sigma * self.global_var.reciprocal().sum()
+            - 0.5 * (2. * torch.pi * self.global_var).log().sum()
+        )
+        self.noise_log_likelihood = self.noise_log_likelihood.item()
 
         # CPU tensors
         self.keepers = torch.from_numpy(keepers)
@@ -270,6 +287,8 @@ class InterpUnit(torch.nn.Module):
         channel_strategy_snr_minamp=3.0,
         var_prior_count=5.0,
         var_cov_max=0.05,
+        cov_kind="diag",
+        prior_variance=1.0,
         imputation_kind=None,
         impute_before_center=False,
         kriging_sigma=None,
@@ -294,10 +313,12 @@ class InterpUnit(torch.nn.Module):
         self.batch_size = batch_size
         self.var_prior_count = var_prior_count
         self.var_cov_max = var_cov_max
+        self.prior_variance = prior_variance
         self.imputation_kind = imputation_kind
         self.impute_before_center = impute_before_center
         self.kriging_sigma = kriging_sigma
         self.impute_batch_size = impute_batch_size
+        self.cov_kind = cov_kind
 
         pca_centered = True
         if self.do_interp:
@@ -499,7 +520,18 @@ class InterpUnit(torch.nn.Module):
         rel_ix=None,
         already_padded=False,
         constant_value=torch.nan,
+        impute_missing=False,
+        padded_geom=None,
     ):
+        if impute_missing:
+            if already_padded:
+                waveforms_rel = waveforms_rel[:, :-1]
+            return self.impute_to_waveform_channels(
+                waveforms_rel,
+                waveform_channels,
+                padded_geom,
+            )
+
         if rel_ix is None:
             rel_ix = self.rel_ix(waveform_channels)
 
@@ -511,6 +543,30 @@ class InterpUnit(torch.nn.Module):
             (n, self.waveform_rank, rel_ix.shape[-1])
         )
         return torch.gather(waveforms_rel, dim=2, index=rel_ix)
+
+    def impute_to_waveform_channels(
+        self,
+        means_rel,
+        waveform_channels,
+        padded_geom,
+    ):
+        n = len(means_rel)
+        means_rel = means_rel.reshape(n, self.waveform_rank, self.n_chans_unit)
+        source_pos = padded_geom[self.channels]
+        source_pos = source_pos[None].broadcast_to((n, *source_pos.shape))
+
+        imputed = torch.zeros((*means_rel.shape[:2], waveform_channels.shape[1]), dtype=means_rel.dtype, device=means_rel.device)
+        for j in range(0, n, self.impute_batch_size):
+            sl = slice(j, j + self.impute_batch_size)
+            kernel_interpolate(
+                means_rel[sl],
+                source_pos[sl],
+                padded_geom[waveform_channels[sl]],
+                sigma=self.kriging_sigma,
+                kind=self.imputation_kind,
+                out=imputed[sl],
+            )
+        return imputed
 
     def residuals_rel(
         self,
@@ -615,6 +671,8 @@ class InterpUnit(torch.nn.Module):
         rel_ix=None,
         common_chans=False,
         min_overlap=None,
+        impute_missing=False,
+        padded_geom=None,
     ):
         """Badnesses
 
@@ -624,7 +682,7 @@ class InterpUnit(torch.nn.Module):
             min_overlap = self.min_overlap
         # a client may already know exactly which spikes they want to compare
         spike_ix = slice(None)
-        if rel_ix is None:
+        if rel_ix is None and not impute_missing:
             overlaps, rel_ix = self.overlaps(waveform_channels)
             (spike_ix,) = torch.nonzero(overlaps >= min_overlap, as_tuple=True)
             waveforms = waveforms[spike_ix]
@@ -634,20 +692,32 @@ class InterpUnit(torch.nn.Module):
 
         # masks are all or nothing along axis=1
         # this mask says: which of each waveform's channels is one I have got?
-        maskb = (rel_ix < self.n_chans_unit).unsqueeze(1)
-        mask = maskb.to(waveforms)
+        if not impute_missing:
+            maskb = (rel_ix < self.n_chans_unit).unsqueeze(1)
+        common_chans = common_chans or impute_missing
         if common_chans:
-            mask *= torch.isfinite(waveforms[:, :1]).to(mask)
+            maska = torch.isfinite(waveforms[:, :1])
+            if not impute_missing:
+                maskb = torch.logical_and(maskb, maska)
+            else:
+                maskb = maska
+            mask = maskb.to(waveforms)
             waveforms = torch.nan_to_num(waveforms * mask)
         else:
+            mask = maskb.to(waveforms)
             waveforms = torch.nan_to_num(waveforms)
 
         # try to reconstruct spikes
-        recons_rel = self.get_means(times, padded=True)
+        recons_rel = self.get_means(times, padded=not impute_missing)
         if times is None:
             recons_rel = recons_rel[None]
         recons = self.to_waveform_channels(
-            recons_rel, rel_ix=rel_ix, already_padded=True
+            recons_rel,
+            rel_ix=rel_ix,
+            waveform_channels=waveform_channels,
+            already_padded=not impute_missing,
+            impute_missing=impute_missing,
+            padded_geom=padded_geom,
         )
         recons = torch.nan_to_num(recons * mask)
 
@@ -658,10 +728,14 @@ class InterpUnit(torch.nn.Module):
             badnesses["mse"] = waveforms.sub(recons).square().mean(dim=(1, 2))
         if "l2" in kinds:
             badnesses["l2"] = l2
-        if any("r^2" in k for k in kinds):
+        if any("r^2" in k for k in kinds) or "cos" in kinds:
             wf_l2 = waveforms.square().sum(dim=(1, 2))
         if "1-r^2" in kinds:
             badnesses["1-r^2"] = l2 / wf_l2
+        if "cos" in kinds:
+            n = len(waveforms)
+            dot = waveforms.view(n, -1) @ recons.view(n, -1).T
+            badnesses["cos"] = 1.0 - dot / (wf_l2.sqrt() * recons.square().sum(dim=(1, 2)).sqrt())
         if "scaledl2" or "1-scaledr^2" in kinds:
             scalings = self.get_scalings(waveforms, recons, already_masked=True)
             scaled_l2 = (
@@ -675,15 +749,30 @@ class InterpUnit(torch.nn.Module):
             maxsq = torch.amax(waveforms.sub(recons).square(), dim=(1, 2))
             meansq = waveforms.square().sum(dim=1).max(dim=1).values
             badnesses["1-maxr^2"] = maxsq / meansq
-        if "diagz" in kinds:
-            dx = waveforms.sub(recons)
-            var = self.var.view(self.waveform_rank, self.n_chans_unit)
-            var = var[None].broadcast_to((len(dx), *var.shape))
-            var = self.to_waveform_channels(var, rel_ix=rel_ix)
+        if ("diagz" in kinds) or ("nll_diag" in kinds):
+            dxsq = waveforms.sub(recons).square_()
+            # var = self.var.view(self.waveform_rank, self.n_chans_unit)
+            var = self.var[None].broadcast_to((len(dxsq), *self.var.shape))
+            var = self.to_waveform_channels(
+                var,
+                rel_ix=rel_ix,
+                waveform_channels=waveform_channels,
+                already_padded=False,
+                impute_missing=impute_missing,
+                padded_geom=padded_geom,
+            )
+            # these terms don't contribute to mahal, and their logs also go to 0,
+            # and they are not counted in dof... in other words goodbye masked vars
             var = torch.where(maskb, var, 1.0)
-            mah = (dx.square() / var).mean(1).sum(1)
+            mah = (dxsq / var).mean(1).sum(1)
             dof = mask.sum(dim=(1, 2)).to(mah)
+        if "diagz" in kinds:
             badnesses["diagz"] = mah / dof
+        if "nll_diag" in kinds:
+            neg_mah = 0.5 * (dxsq / var).sum(dim=(1, 2))
+            neg_cov_det = var.log().mul_(0.5).sum(dim=(1, 2))
+            neg_pis = dof * (0.5 * np.log(2 * np.pi))
+            badnesses["nll_diag"] = neg_mah + neg_cov_det + neg_pis
 
         return spike_ix, overlaps, badnesses
 
@@ -830,8 +919,9 @@ class InterpUnit(torch.nn.Module):
         else:
             if weights is None:
                 weights = torch.ones(n).to(waveforms)
-            weights = weights / weights.sum()
-            mean = torch.nansum(weights[:, None] * waveforms_rel.reshape(n, -1), dim=0)
+            weights = weights[:, None] * torch.isfinite(waveforms_rel.reshape(n, -1)).to(waveforms)
+            weights /= weights.sum(0)
+            mean = torch.nansum(weights * waveforms_rel.reshape(n, -1), dim=0)
             mean = torch.nan_to_num(mean)
             if mean.abs().max() > 1000:
                 print(f"{torch.nan_to_num(waveforms).min()=} {torch.nan_to_num(waveforms).max()=}")
@@ -850,28 +940,39 @@ class InterpUnit(torch.nn.Module):
                     mean,
                 )
             if with_var:
+                prior_var = torch.as_tensor(self.prior_variance).to(self.mean)
+                if prior_var.numel() > 1:
+                    assert prior_var.shape == (waveforms.shape[1],)
+                    prior_var = prior_var.unsqueeze(1).broadcast_to((*prior_var.shape, self.n_chans_unit)).flatten()
+
                 dxsq = (waveforms_rel.reshape(n, -1) - self.mean).square_()
-                var = torch.nansum(weights[:, None] * dxsq, dim=0)
-                var = torch.nan_to_num(var, nan=1.0)
-                nobs = torch.isfinite(waveforms_rel).sum(0).view(-1).to(var)
-                lambd = nobs / (nobs + self.var_prior_count)
-                var = var * lambd + 1.0 * (1 - lambd)
-                std = var.sqrt()
+                # assert (var > 0).all()
+                if self.cov_kind == "single":
+                    v1 = torch.nansum(weights * dxsq, dim=0)
+                    v1 = torch.nanmean(v1)
+                    v2 = prior_var.mean()
+                    lambd = n / (n + self.var_prior_count)
+                    var = torch.full_like(mean, lambd * v1 + v2 * (1 - lambd))
+                elif self.cov_kind == "diag":
+                    var = torch.nansum(weights * dxsq, dim=0)
+                    var = torch.nan_to_num(var, nan=0.0)
+                    nobs = torch.isfinite(waveforms_rel).sum(0).view(-1).to(var)
+                    lambd = nobs / (nobs + self.var_prior_count)
+                    var = var * lambd + prior_var * (1 - lambd)
+                else:
+                    assert False
 
                 # soft version of min
-                norm_mean = torch.norm(self.mean)
-                cov = std / norm_mean
-                cov = cov.clamp(max=self.var_cov_max)
-                var = torch.square(cov * norm_mean)
+                # norm_mean = torch.norm(self.mean)
+                # cov = std / norm_mean
+                # cov = cov.clamp(max=self.var_cov_max)
+                # var = torch.square(cov * norm_mean)
 
                 # var = 1.0 + F.softplus(var - 1.0)
                 if hasattr(self, "var"):
                     self.var.copy_(var)
                 else:
-                    self.register_buffer(
-                        "var",
-                        var,
-                    )
+                    self.register_buffer("var", var)
 
     def impute(
         self,
@@ -947,8 +1048,8 @@ class InterpUnit(torch.nn.Module):
                 sl = slice(j, j + self.impute_batch_size)
                 kernel_interpolate(
                     waveforms[sl],
-                    padded_registered_geom[waveform_channels[sl]],
-                    target_pos[sl],
+                    source_pos=padded_registered_geom[waveform_channels[sl]],
+                    target_pos=target_pos[sl],
                     sigma=self.kriging_sigma,
                     kind=imputation_kind,
                     out=imputed[sl],
@@ -1063,16 +1164,23 @@ class InterpClusterer(torch.nn.Module):
         max_n_spikes=5000000,
         reassign_metric="1-scaledr^2",
         merge_metric="1-scaledr^2",
+        cov_kind="global",
         merge_threshold=0.25,
+        zip_threshold_floor=0.1,
         zip_threshold=0.15,
+        zip_by_quantile=False,
+        zip_metric="1-r^2",
         merge_sym_function=torch.maximum,
         merge_linkage="complete",
         merge_with_bimodality=True,
-        bimodality_threshold=0.5,
+        bimodality_threshold=0.05,
+        bimodality_kind="isotonic",
         channel_strategy="snr",
         channel_strategy_snr_min=25.0,
         channel_strategy_snr_minamp=2.5,
         merge_on_waveform_radius=True,
+        kmeans_nclust=5,
+        kmeans_niter=50,
         interp_kind="nearest",
         imputation_kind="pca",
         impute_before_center=False,
@@ -1100,7 +1208,10 @@ class InterpClusterer(torch.nn.Module):
         self.split_sampling_method = split_sampling_method
         self.split_waveform_kind = split_waveform_kind
         self.sampling_sigma = sampling_sigma
+        self.zip_threshold_floor = zip_threshold_floor
         self.zip_threshold = zip_threshold
+        self.zip_by_quantile = zip_by_quantile
+        self.zip_metric = zip_metric
         self.channel_strategy = channel_strategy
         self.batch_size = batch_size
         self.merge_with_bimodality = merge_with_bimodality
@@ -1108,6 +1219,11 @@ class InterpClusterer(torch.nn.Module):
         self._reas_bufs = {}
         self.labels_lock = threading.Lock()
         self.imputation_kind = imputation_kind
+        self.kmeans_nclust = kmeans_nclust
+        self.kmeans_niter = kmeans_niter
+        self.cov_kind = cov_kind
+        self.var = None
+        self.bimodality_kind = bimodality_kind
 
         self.data = _load_data(
             sorting,
@@ -1144,6 +1260,8 @@ class InterpClusterer(torch.nn.Module):
             kriging_sigma=self.data.kriging_sigma,
             imputation_kind=imputation_kind,
             impute_before_center=impute_before_center,
+            prior_variance=self.data.global_var,
+            cov_kind="diag" if self.cov_kind == "diag" else "single",
         )
 
         torch.manual_seed(self.rg.bit_generator.random_raw())
@@ -1163,6 +1281,8 @@ class InterpClusterer(torch.nn.Module):
         self.merge_sym_function = merge_sym_function
         self.merge_on_waveform_radius = merge_on_waveform_radius
         self.match_threshold = match_threshold
+        if match_threshold == "noise_nll":
+            self.match_threshold = -self.data.noise_log_likelihood
 
         self.cleanup()
 
@@ -1250,18 +1370,23 @@ class InterpClusterer(torch.nn.Module):
             min_cluster_size = self.min_cluster_size
 
         big_enough = counts >= min_cluster_size
+        too_small = torch.logical_not(big_enough).sum()
+        info = f"Removed {too_small} low-count units"
         if remove_low_snr and self.channel_strategy == "snr" and len(self.models):
             nc = [self[u].n_chans_unit for u in self.unit_ids()]
             min_chans = self.data.n_chans_reassign * self.min_overlap
-            big_enough = torch.logical_and(big_enough, torch.tensor(nc) >= min_chans)
+            good_signal = torch.tensor(nc) >= min_chans
+            n_bad_signal = torch.logical_and(big_enough, torch.logical_not(good_signal)).sum()
+            if n_bad_signal:
+                info += f" and {n_bad_signal} low-signal units"
+            big_enough = torch.logical_and(big_enough, good_signal)
 
         n_removed = torch.logical_not(big_enough).sum()
         if n_removed:
             count_removed = counts[torch.logical_not(big_enough)].sum()
             pct_removed = 100 * count_removed / len(self.data.keepers)
             print(
-                f"Removed {n_removed} too-small units ({pct_removed:0.1f}% of spikes). "
-                f"New unit count: {big_enough.sum()}."
+                f"{info} ({pct_removed:0.1f}% of spikes). New unit count: {big_enough.sum()}."
             )
         self.update_labels(old_labels[big_enough], flat=False)
         return big_enough
@@ -1290,7 +1415,6 @@ class InterpClusterer(torch.nn.Module):
         n_threads=0,
         with_var=True,
         weights_kind=None,
-        weights_sparse=None,
         divergences=None,
     ):
         """Fit all models that need fitting."""
@@ -1303,53 +1427,41 @@ class InterpClusterer(torch.nn.Module):
                     if uid not in self or self[uid].needs_fit:
                         to_fit.append(uid)
 
-        if weights_kind is not None and weights_sparse is None:
-            weights_sparse = self.reassignment_weights(
+        weights_info = {}
+        if weights_kind is not None:
+            weights_info = self.reassignment_weights(
                 unit_ids=to_fit,
                 show_progress=False,
                 n_threads=n_threads,
                 kind=weights_kind,
                 divergences=divergences,
+                sampling_method=self.sampling_method,
             )
-
-        if force:
-            self.models.clear()
 
         def fit_unit(j, uid):
-            if force or uid not in self:
-                model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
-                model.to(self.device)
-                if store:
-                    self[uid] = model
-            else:
-                model = self[uid]
+            model = InterpUnit(do_interp=self.do_interp, **self.unit_kw)
+            model.to(self.device)
 
+            in_unit, weights = weights_info.get(uid, (None, None))
             in_unit, train_data = self.get_training_data(
-                uid, waveform_kind="original", sampling_method=self.sampling_method
+                uid,
+                waveform_kind="original",
+                sampling_method=self.sampling_method,
+                in_unit=in_unit,
             )
-
-            weights = None
-            if weights_sparse is not None:
-                weights = (
-                    torch.index_select(
-                        weights_sparse[j],
-                        0,
-                        in_unit.to(weights_sparse.device),
-                    )
-                    .to_dense()
-                    .to(train_data["waveforms"])
-                )
 
             try:
                 model.fit_center(
-                    **train_data, padded_geom=self.data.padded_registered_geom, weights=weights, show_progress=False, with_var=with_var
+                    **train_data,
+                    padded_geom=self.data.padded_registered_geom,
+                    weights=weights,
+                    show_progress=False,
+                    with_var=with_var
                 )
             except ValueError:
                 with self.labels_lock:
                     self.labels[self.labels == uid] = -1
-                    if store:
-                        del self.models[self.normalize_key(uid)]
-                    return
+                    return uid, None
             model.fit_indices = None
             if fit_residual:
                 in_unit, train_data = self.get_training_data(
@@ -1366,8 +1478,9 @@ class InterpClusterer(torch.nn.Module):
                     padded_registered_geom=self.data.padded_registered_geom,
                 )
                 model.fit_indices = in_unit
-            return model
+            return uid, model
 
+        fit_ids = []
         fit_units = []
         if n_threads:
             res = joblib.Parallel(
@@ -1375,15 +1488,30 @@ class InterpClusterer(torch.nn.Module):
             )(joblib.delayed(fit_unit)(j, uu) for j, uu in enumerate(to_fit))
             if show_progress:
                 res = tqdm(res, desc="M step", total=len(to_fit), **tqdm_kw)
-            for model in res:
+            for uid, model in res:
                 if model is not None:
+                    fit_ids.append(uid)
                     fit_units.append(model)
         else:
             if show_progress:
                 to_fit = tqdm(to_fit, desc="M step", **tqdm_kw)
 
             for j, uu in enumerate(to_fit):
-                fit_units.append(fit_unit(j, uu))
+                uid, model = fit_unit(j, uu)
+                if model is not None:
+                    fit_ids.append(uid)
+                    fit_units.append(model)
+        if with_var:
+            var = np.mean([u.var.flatten()[0].numpy(force=True) for u in fit_units])
+            self.var = var
+            var = torch.tensor(var, device=self.device)
+            if self.cov_kind == "global":
+                for u in fit_units:
+                    u.var.fill_(var)
+        if force:
+            self.models.clear()
+        for uid, u in zip(fit_ids, fit_units):
+            self[uid] = u
 
         return fit_units
 
@@ -1407,6 +1535,9 @@ class InterpClusterer(torch.nn.Module):
         ).all()
         new_clusters, new_counts = np.unique(reclustered.labels, return_counts=True)
         valid = new_clusters >= 0
+        if not valid.any():
+            print("Reclustering didn't find anything.")
+            return
         new_counts = new_counts[valid]
         new_clusters = new_clusters[valid]
         orig_outlier_count = (self.labels < 0).sum()
@@ -1477,9 +1608,9 @@ class InterpClusterer(torch.nn.Module):
         # self.cleanup()
         # self.order_by_depth()
 
-    def split_features(self, uid, in_unit=None):
+    def split_features(self, uid, in_unit=None, force_train=False):
         (in_unit_full,) = (self.labels == uid).nonzero(as_tuple=True)
-        if self.dpc_split_kw.split_on_train:
+        if force_train or self.dpc_split_kw.split_on_train:
             assert in_unit is None
             if self[uid].pca.train_loadings is None:
                 return in_unit_full, None, None
@@ -1487,18 +1618,35 @@ class InterpClusterer(torch.nn.Module):
             features = self[uid].pca.train_loadings[:, : self.dpc_split_kw.rank]
             features = features.numpy(force=True)
             return in_unit_full, in_unit, features
-        if in_unit is None:
-            in_unit = in_unit_full
-        n = in_unit.numel()
-        features = torch.empty((n, self.residual_pca_rank), device=self.device)
-        unit = self[uid]
-        ci = self.data.registered_original_channel_index
-        if self.split_waveform_kind == "reassign":
-            ci = self.data.registered_reassign_channel_index
-        for sl, data in self.batches(in_unit, waveform_kind=self.split_waveform_kind):
-            unit.residual_embed(**data, out=features[sl], waveform_channel_index=ci)
+
+        in_unit, data = self.get_training_data(
+            uid,
+            n=None,
+            in_unit=in_unit,
+            waveform_kind=self.split_waveform_kind,
+            sampling_method=self.split_sampling_method,
+        )
+        features = self[uid].residual_embed(
+            times=data['times'],
+            waveforms=data['waveforms'],
+            waveform_channels=data['waveform_channels'],
+            waveform_channel_index=data['waveform_channel_index'],
+        )
         features = features[:, : self.dpc_split_kw.rank].numpy(force=True)
         return in_unit_full, in_unit, features
+
+        # if in_unit is None:
+        #     in_unit = in_unit_full
+        # n = in_unit.numel()
+        # features = torch.empty((n, self.residual_pca_rank), device=self.device)
+        # unit = self[uid]
+        # ci = self.data.registered_original_channel_index
+        # if self.split_waveform_kind == "reassign":
+        #     ci = self.data.registered_reassign_channel_index
+        # for sl, data in self.batches(in_unit, waveform_kind=self.split_waveform_kind):
+        #     unit.residual_embed(**data, out=features[sl], waveform_channel_index=ci)
+        # features = features[:, : self.dpc_split_kw.rank].numpy(force=True)
+        # return in_unit_full, in_unit, features
 
     def dpc_split_unit(self, unit_id):
         """
@@ -1549,7 +1697,7 @@ class InterpClusterer(torch.nn.Module):
                 unit.needs_fit = True
                 self.labels[in_unit_full] = -1
                 self.labels[in_unit[split_labels >= 0]] = unit_id
-                return 0, []
+            return 0, []
 
         # case 0: nothing happened.
         if n_split <= n_split_full <= 1:
@@ -1564,98 +1712,28 @@ class InterpClusterer(torch.nn.Module):
         assert n_split > 1
         assert split_units[0] == 0
 
-        if not self.dpc_split_kw.reassign_within_split:
-            with self.labels_lock:
-                self.labels[in_unit_full] = -1
-                new_unit_ids = (
-                    unit_id,
-                    *(
-                        self.labels.max()
-                        + torch.arange(1, n_split, dtype=self.labels.dtype)
-                    ),
-                )
-                for split_label, new_label in zip(split_units, new_unit_ids):
-                    in_split = in_unit[split_labels == split_label]
-                    self.labels[in_split] = new_label
-            return len(new_unit_ids) - 1, new_unit_ids
-
-        # reassign within units
-        new_units = []
-        for j, label in enumerate(split_units):
-            u = InterpUnit(
-                do_interp=False,
-                **self.unit_kw,
-            )
-            inu = in_unit[split_labels == label]
-            inu, train_data = self.get_training_data(
-                unit_id=None,
-                waveform_kind="original",
-                in_unit=inu,
-                sampling_method=self.sampling_method,
-            )
-            u.fit_center(**train_data, show_progress=False)
-            new_units.append(u)
-        divergences = self.reassignment_divergences(
-            which_spikes=in_unit_full,
-            units=new_units,
-            show_progress=False,
-            exclude_above=self.match_threshold,
-        )
-        split_labels = sparse_reassign(divergences)
-        kept = np.flatnonzero(split_labels >= 0)
-
-        # if reassign kills everything, just keep the state before reassignment
-        if not kept.size:
-            with self.labels_lock:
-                self.labels[in_unit_full] = -1
-                new_unit_ids = (
-                    unit_id,
-                    *(
-                        self.labels.max()
-                        + torch.arange(1, n_split, dtype=self.labels.dtype)
-                    ),
-                )
-                for split_label, new_label in zip(split_units, new_unit_ids):
-                    in_split = in_unit[split_labels_orig == split_label]
-                    self.labels[in_split] = new_label
-            return len(new_unit_ids) - 1, new_unit_ids
-
-        split_units, counts = np.unique(split_labels[kept], return_counts=True)
-        split_units = split_units[counts >= self.min_cluster_size]
-        n_split = split_units.size
-        if n_split <= 1:
-            return 0, []
-
-        with self.labels_lock:
-            self.labels[in_unit_full] = -1
-            new_unit_ids = (
-                unit_id,
-                *(
-                    self.labels.max()
-                    + torch.arange(1, n_split, dtype=self.labels.dtype)
-                ),
-            )
-            for split_label, new_label in zip(split_units, new_unit_ids):
-                in_split = in_unit_full[split_labels == split_label]
-                self.labels[in_split] = new_label
-
-        return len(new_unit_ids) - 1, new_unit_ids
+        return self.reassign_within_split(unit_id, in_unit_full, in_unit, split_units, split_labels)
 
     def kmeanspp(
         self,
         unit_id,
         sampling_method="time_amp_reweighted",
-        n_clust=5,
+        n_clust=10,
         n_iter=0,
-        seed_with="mean",
-        drop_prop=0.02,
+        seed_with="random",
+        drop_prop=0.025,
+        with_proportions=True,
+        equilibrium_kmeans_alpha=0.0,
+        verbose=False,
     ):
+        if verbose:
+            print(f"{unit_id=} {sampling_method=} {n_clust=} {n_iter=} {seed_with=} {drop_prop=} {verbose=}")
         in_unit, data = self.get_training_data(
             unit_id,
             n=None,
             in_unit=None,
             waveform_kind=self.split_waveform_kind,
-            sampling_method=None,
+            sampling_method=self.split_sampling_method,
         )
         n_clust = min(n_clust, in_unit.numel() // self.min_cluster_size)
         waveforms = self[unit_id].impute(
@@ -1719,65 +1797,76 @@ class InterpClusterer(torch.nn.Module):
 
         e = None
         if n_iter:
-            e = F.one_hot(assignments, num_classes=n_clust).to(waveforms)
-            centroids = (e / e.sum(0)).T @ waveforms
+            centroids = waveforms[centroid_ixs]
             dists = torch.cdist(waveforms, centroids).square_()
+            if with_proportions:
+                proportions = torch.ones(len(centroids)).to(dists)
             # try:
             for i in range(n_iter):
                 # update responsibilities, n x k
-                # err_str = ""
-                e = F.softmax(-0.5 * dists, dim=1)
-                # err_str += "\n" + (f"{i=} aa {e.shape=} {e.sum(0)=} {e.mean(0)=}")
-                # err_str += "\n" + (f"{i=} ab {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                if with_proportions:
+                    e = F.softmax(-0.5 * dists + proportions.log(), dim=1)
+                else:
+                    e = F.softmax(-0.5 * dists, dim=1)
 
                 # delete too-small centroids
-                # err_str += "\n" + (f"{i=} ba {e.shape=} {e.sum(0)=} {e.mean(0)=}")
                 if drop_prop is not None:
-                    e = e[:, e.mean(0) >= drop_prop]
-                # err_str += "\n" + (f"{i=} bb {e.shape=} {e.sum(0)=} {e.mean(0)=}")
+                    props = e.mean(0)
+                    keep = props >= drop_prop
+                    e = e[:, keep]
+
+                # update proportions while still spike-normalized (resps)
+                if with_proportions:
+                    proportions = props[keep]
+
+                if equilibrium_kmeans_alpha > 0:
+                    # https://arxiv.org/pdf/2402.14490
+                    dists = dists[:, keep]
+                    e = F.softmax(-0.5 * equilibrium_kmeans_alpha * dists + proportions.log(), dim=1)
+                    d_term = dists - (0.5 * dists * e).sum(1, keepdim=True)
+                    e = e * (1.0 - equilibrium_kmeans_alpha * d_term)
+
+                # normalize per centroid
                 e = e.div_(e.sum(0))
-                # err_str += "\n" + (f"{i=} bc {e.shape=} {e.sum(0)=} {e.mean(0)=}")
 
                 # update centroids
                 centroids = e.T @ waveforms
-                # err_str += "\n" + (f"{i=} {centroids.shape=}")
-                # dists = waveforms[:, None, :] - centroids[None, :, :]
-                # err_str += "\n" + (f"{i=} {dists.shape=}")
-                # dists = dists.square_().sum(2)
                 dists = torch.cdist(waveforms, centroids).square_()
-                # err_str += "\n" + (f"{i=} {dists.shape=}")
                 assignments = torch.argmin(dists, 1)
                 if e.shape[1] == 1:
                     break
-            # except:
-            #     print()
-            #     print(f"{torch.isnan(waveforms).to(torch.float).mean()=}")
-            #     print(f"{torch.isinf(waveforms).to(torch.float).mean()=}")
-            #     centroids = waveforms[centroid_ixs]
-            #     print(f"{torch.isnan(centroids).to(torch.float).mean()=}")
-            #     print(f"{torch.isinf(centroids).to(torch.float).mean()=}")
-            #     print(f"{centroids=}")
-            #     print(f"{centroids.min()=}")
-            #     print(f"{centroids.max()=}")
-            #     print(f"{waveforms.min()=}")
-            #     print(f"{waveforms.max()=}")
-            #     print(f"{waveforms[10]=}")
-            #     print(f"{waveforms[22]=}")
-            #     print(f"{waveforms.shape=} {centroids.shape=}")
-            #     dists = torch.cdist(waveforms[None], centroids[None])[0]
-            #     print(f"yy {dists=} {torch.isnan(dists).any()=} {torch.isinf(dists.any())=}")
-            #     print(f"{dists.shape=} {dists.min()=} {dists.max()=}")
-            #     print(err_str)
-            #     raise
 
         return in_unit, assignments.to(in_unit), e
 
     def constrain_split_centroids(
-        self, unit_id, in_unit, sub_labels, weights=None, inherit_chans=True
+        self,
+        unit_id,
+        in_unit,
+        sub_labels,
+        weights=None,
+        inherit_chans=True,
+        impute_before_center=True,
+        with_bimodality=True,
+        common_chans=False,
+        verbose=False,
     ):
+        if verbose: print(f"{unit_id=} {weights is None=} {inherit_chans=} {impute_before_center=} {common_chans=} {self.zip_metric=}")
         ids = torch.unique(sub_labels)
         ids = ids[ids >= 0]
         new_units = []
+        zip_threshold = self.zip_threshold
+        if self.zip_by_quantile:
+            in_unit, utd = self.get_training_data(unit_id, in_unit=in_unit, waveform_kind="reassign")
+            spike_ix, overlaps, badnesses = self[unit_id].spike_badnesses(
+                utd["times"],
+                utd["waveforms"],
+                utd["waveform_channels"],
+                kinds=(self.zip_metric,)
+            )
+            zip_threshold = max(
+                self.zip_threshold_floor,
+                torch.quantile(badnesses[self.zip_metric], zip_threshold),
+            )
 
         # fit sub-units
         chan_kw = {}
@@ -1788,11 +1877,9 @@ class InterpClusterer(torch.nn.Module):
             )
         alive_labels = np.full_like(sub_labels, -1)
         cur_ix = 0
+        unit_kw = self.unit_kw | dict(impute_before_center=impute_before_center)
         for j, label in enumerate(ids):
-            u = InterpUnit(
-                do_interp=False,
-                **self.unit_kw,
-            )
+            u = InterpUnit(do_interp=False, **unit_kw)
             inu = in_unit[sub_labels == label]
             w = None
             if weights is not None:
@@ -1804,7 +1891,13 @@ class InterpClusterer(torch.nn.Module):
                 sampling_method=self.sampling_method,
             )
             try:
-                u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom, weights=w, **chan_kw)
+                u.fit_center(
+                    **train_data,
+                    show_progress=False,
+                    padded_geom=self.data.padded_registered_geom,
+                    weights=w,
+                    **chan_kw,
+                )
                 new_units.append(u)
                 alive_labels[sub_labels == label] = cur_ix
                 cur_ix += 1
@@ -1815,11 +1908,11 @@ class InterpClusterer(torch.nn.Module):
         ju = [(j, u) for j, u in enumerate(new_units) if u.n_chans_unit]
 
         # sub-merge
-        kind = self.merge_metric
         min_overlap = self.min_overlap
         subset_channel_index = None
         if self.merge_on_waveform_radius:
             subset_channel_index = self.data.registered_reassign_channel_index
+        if verbose: print(f"constrain {min_overlap=} {subset_channel_index is None=}")
         nu = len(new_units)
         divergences = torch.full((nu, nu), torch.nan)
         for i, ua in ju:
@@ -1829,22 +1922,42 @@ class InterpClusterer(torch.nn.Module):
                     continue
                 divergences[i, j] = ua.divergence(
                     ub,
-                    kind=kind,
+                    kind=self.zip_metric,
                     min_overlap=min_overlap,
                     subset_channel_index=subset_channel_index,
+                    common_chans=common_chans
                 )
+        if verbose: print(f"constr A {divergences.max()=} {divergences=}")
 
         dists = self.merge_sym_function(divergences, divergences.T)
         dists = dists.numpy(force=True)
         valid = np.isfinite(dists)
         if not valid.all():
             dists[np.logical_not(valid)] = dists[valid].max() + 10
+        if verbose: print(f"constr B {dists.max()=} {dists=}")
+
+        if with_bimodality:
+            bimodalities = self.bimodalities_prefit(
+                new_units,
+                in_unit,
+                n_threads=0,
+                impute_missing=impute_before_center,
+                common_chans=common_chans,
+            )
+            if verbose: print(f"constr C {bimodalities=}")
+            bimodalities *= zip_threshold / self.bimodality_threshold
+            dists = np.maximum(bimodalities, dists)
+        if verbose: print(f"constr D {dists.max()=} {dists=}")
+        if verbose: print(f"{zip_threshold=}")
+
         d = dists[np.triu_indices(dists.shape[0], k=1)]
         Z = linkage(d, method=self.merge_linkage)
-        new_labels = fcluster(Z, self.zip_threshold, criterion="distance")
+        new_labels = fcluster(Z, zip_threshold, criterion="distance")
+        if verbose: print(f"fcluster {dists.shape=} {new_labels=}")
         new_labels -= 1
 
         _, merge_labels = np.unique(new_labels[alive_labels], return_inverse=True)
+        if verbose: print(f"fcluster {np.unique(merge_labels, return_counts=True)=}")
 
         labels = np.where(
             alive_labels >= 0,
@@ -1861,7 +1974,7 @@ class InterpClusterer(torch.nn.Module):
             for unit_id in tqdm(self.unit_ids(), desc="kmeans split"):
                 n_new_unit, newids = self.kmeans_split_unit(unit_id)
                 if verbose and newids:
-                    print(f"{unit_id=} {newids=}")
+                    print(f"unit {unit_id.numpy(force=True)} -> {[ni.numpy().item() for ni in newids]}")
                 n_new += n_new_unit
         else:
             jobs = self.unit_ids()
@@ -1882,15 +1995,17 @@ class InterpClusterer(torch.nn.Module):
 
         print(f"kmeans split broke off {n_new} new units.")
 
-    def kmeans_split_unit(self, unit_id):
+    def kmeans_split_unit(self, unit_id, verbose=False):
         (in_unit_full,) = torch.nonzero(self.labels == unit_id, as_tuple=True)
-        in_unit, split_labels, weights = self.kmeanspp(unit_id, n_clust=5, n_iter=50)
+        in_unit, split_labels, weights = self.kmeanspp(unit_id, n_clust=self.kmeans_nclust, n_iter=self.kmeans_niter, verbose=verbose)
         split_units, split_labels = torch.unique(split_labels, return_inverse=True)
+        if verbose: print(f"kmeanspp {split_units=} {np.unique(split_labels, return_counts=True)=}")
         if split_units.numel() <= 1:
             return 0, []
-        split_labels_orig = split_labels = self.constrain_split_centroids(
-            unit_id, in_unit, split_labels, weights=weights
+        split_labels = self.constrain_split_centroids(
+            unit_id, in_unit, split_labels, weights=weights, verbose=verbose
         )
+        if verbose: print(f"constrained {np.unique(split_labels, return_counts=True)=}")
 
         split_units, counts = np.unique(split_labels, return_counts=True)
         n_split_full = split_units.size
@@ -1898,18 +2013,23 @@ class InterpClusterer(torch.nn.Module):
         counts = counts[valid]
         split_units = split_units[valid]
         n_split = split_units.size
+        split_labels = np.where(np.isin(split_labels, split_units), split_labels, -1)
+        if verbose: print(f"kmeanspp constrained and counted {n_split=} {split_units=} {counts=}")
 
         # case 1: single-unit outlier removal. re-fit but don't re-split.
         if n_split_full >= n_split == 1:
-            if self.dpc_split_kw.allow_single_cluster_outlier_removal:
+            if self.dpc_split_kw.allow_single_cluster_outlier_removal and (n_split_full > n_split):
+                if verbose: print(f"outlier removal")
                 self[unit_id].needs_fit = True
                 self.labels[in_unit_full] = -1
-                self.labels[in_unit[split_labels >= 0]] = unit_id
-                return 0, []
+                self.labels[in_unit[np.isin(split_labels, split_units)]] = unit_id
+            if verbose: print("exit A")
+            return 0, []
 
         # case 0: nothing happened.
         assert n_split <= n_split_full
         if n_split <= n_split_full <= 1:
+            if verbose: print("exit B")
             return 0, []
 
         # in all cases below, we want to re-fit this unit
@@ -1918,8 +2038,14 @@ class InterpClusterer(torch.nn.Module):
         # case 2: something legitimately took place.
         # here, split_unit 0 retains label uid. split units >=1 get new labels.
         assert n_split > 1, f"{n_split=} {n_split_full=}"
+        return self.reassign_within_split(unit_id, in_unit_full, in_unit, split_units, split_labels, verbose=verbose)
+
+    def reassign_within_split(self, unit_id, in_unit_full, in_unit, split_units, split_labels, verbose=False):
+        split_labels_orig = split_labels
+        n_split = split_units.size
 
         if not self.dpc_split_kw.reassign_within_split:
+            if verbose: print(f"no reassign, exit")
             with self.labels_lock:
                 self.labels[in_unit_full] = -1
                 new_unit_ids = (
@@ -1932,23 +2058,25 @@ class InterpClusterer(torch.nn.Module):
                 for split_label, new_label in zip(split_units, new_unit_ids):
                     in_split = in_unit[split_labels == split_label]
                     self.labels[in_split] = new_label
-            return len(new_unit_ids) - 1, new_unit_ids
 
         # reassign within units
         new_units = []
         for j, label in enumerate(split_units):
-            u = InterpUnit(
-                do_interp=False,
-                **self.unit_kw,
-            )
-            inu = in_unit[split_labels == label]
-            inu, train_data = self.get_training_data(
-                unit_id=None,
-                waveform_kind="original",
-                in_unit=inu,
-                sampling_method=self.sampling_method,
-            )
-            u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom)
+            try:
+                u = InterpUnit(
+                    do_interp=False,
+                    **self.unit_kw,
+                )
+                inu = in_unit[split_labels == label]
+                inu, train_data = self.get_training_data(
+                    unit_id=None,
+                    waveform_kind="original",
+                    in_unit=inu,
+                    sampling_method=self.sampling_method,
+                )
+                u.fit_center(**train_data, show_progress=False, padded_geom=self.data.padded_registered_geom)
+            except ValueError:
+                pass
             new_units.append(u)
         divergences = self.reassignment_divergences(
             which_spikes=in_unit_full,
@@ -1958,6 +2086,7 @@ class InterpClusterer(torch.nn.Module):
         )
         split_labels = sparse_reassign(divergences)
         kept = np.flatnonzero(split_labels >= 0)
+        if verbose: print(f"reassign {kept.size=} {np.unique(split_labels, return_counts=True)=}")
 
         # if reassign kills everything, just keep the state before reassignment
         if not kept.size:
@@ -1978,6 +2107,7 @@ class InterpClusterer(torch.nn.Module):
         split_units, counts = np.unique(split_labels[kept], return_counts=True)
         split_units = split_units[counts >= self.min_cluster_size]
         n_split = split_units.size
+        if verbose: print(f"reassign big enough {n_split=}")
         if n_split <= 1:
             return 0, []
 
@@ -1994,6 +2124,7 @@ class InterpClusterer(torch.nn.Module):
                 in_split = in_unit_full[split_labels == split_label]
                 self.labels[in_split] = new_label
         return len(new_unit_ids) - 1, new_unit_ids
+
 
     def parcellate(self):
         unit_ids_to_split = list(self.unit_ids())
@@ -2257,12 +2388,19 @@ class InterpClusterer(torch.nn.Module):
         return overlaps
 
     def central_divergences(
-        self, units_a=None, units_b=None, kind=None, min_overlap=0.1, n_threads=0
+        self,
+        units_a=None,
+        units_b=None,
+        kind=None,
+        min_overlap=0.1,
+        n_threads=0,
+        allow_chan_subset=True,
+        common_chans=False,
     ):
         if kind is None:
             kind = self.merge_metric
         subset_channel_index = None
-        if self.merge_on_waveform_radius:
+        if allow_chan_subset and self.merge_on_waveform_radius:
             subset_channel_index = self.data.registered_reassign_channel_index
         if min_overlap is None:
             min_overlap = 1.0 - self.merge_threshold
@@ -2274,7 +2412,8 @@ class InterpClusterer(torch.nn.Module):
         nua = len(units_a)
         nub = len(units_b)
         divergences = torch.full((nua, nub), torch.inf)
-        divergences.diagonal().fill_(0.0)
+        if torch.equal(units_a, units_b):
+            divergences.diagonal().fill_(0.0)
         overlaps = self.unit_channel_overlaps(units_a, units_b).numpy(force=True)
         valid_pairs = [np.flatnonzero((o >= min_overlap) & (o > 0)) for o in overlaps]
 
@@ -2290,6 +2429,7 @@ class InterpClusterer(torch.nn.Module):
                         kind=kind,
                         min_overlap=min_overlap,
                         subset_channel_index=subset_channel_index,
+                        common_chans=common_chans,
                     )
             return divergences
 
@@ -2302,15 +2442,23 @@ class InterpClusterer(torch.nn.Module):
                 if ua == ub:
                     divergences[i, j] = 0
                     continue
-                if torch.isin(self[ub].channels_valid, ca).sum() < (
-                    self.merge_threshold * ca.numel()
-                ):
-                    continue
+                # if kind == "1-r^2":
+                #     if torch.isin(self[ub].channels_valid, ca).sum() < (
+                #         self.merge_threshold * ca.numel()
+                #     ):
+                #         continue
+                # else:
+                #     # if torch.isin(self[ub].channels_valid, ca).sum() < (
+                #     #     self.min_overlap * ca.numel()
+                #     # ):
+                #     #     continue
+                #     pass
                 divergences[i, j] = self[ua].divergence(
                     self[ub],
                     kind=kind,
                     min_overlap=min_overlap,
                     subset_channel_index=subset_channel_index,
+                    common_chans=common_chans,
                 )
 
         results = joblib.Parallel(
@@ -2328,6 +2476,9 @@ class InterpClusterer(torch.nn.Module):
         mask_radius_s=5.0,
         n_threads=0,
         compute_mask=None,
+        impute_missing=True,
+        common_chans=False,
+        max_spikes=2048,
     ):
         unit_ids = self.unit_ids()
         nu = len(unit_ids)
@@ -2344,7 +2495,8 @@ class InterpClusterer(torch.nn.Module):
             else:
                 memo[self.normalize_key(ua)] = in_a.numpy(force=True), None
 
-        for i, ua in enumerate(unit_ids):
+        @joblib.delayed
+        def unit_bimodality_job(i, ua):
             for j, ub in enumerate(unit_ids):
                 if j <= i:
                     continue
@@ -2366,6 +2518,12 @@ class InterpClusterer(torch.nn.Module):
                     b_matched = np.isfinite(b_matched[0])
                     in_a = in_a[a_matched]
                     in_b = in_b[b_matched]
+                if in_a.size > max_spikes:
+                    in_a = self.rg.choice(in_a, size=max_spikes, replace=False)
+                    in_a.sort()
+                if in_b.size > max_spikes:
+                    in_b = self.rg.choice(in_b, size=max_spikes, replace=False)
+                    in_b.sort()
 
                 na = in_a.size
                 nb = in_b.size
@@ -2389,45 +2547,119 @@ class InterpClusterer(torch.nn.Module):
                     which_spikes=torch.from_numpy(which).to(self.labels),
                     unit_ids=[ua, ub],
                     show_progress=False,
+                    impute_missing=impute_missing,
+                    common_chans=common_chans,
                 )
                 # replace sparse zeros with 1s (explicit 0s are cool though)
                 tmp_dense = np.full(badness.shape, np.inf)
                 tmp_dense[badness.coords] = badness.data
-                tmp_dense = np.nan_to_num(tmp_dense, nan=1.0, posinf=1.0, copy=False)
-                bad_a, bad_b = tmp_dense
-                dbad = bad_a - bad_b
-                unique_dbad, inverse = np.unique(dbad, return_inverse=True)
 
-                weights = np.zeros(unique_dbad.shape)
-                np.add.at(weights, inverse, sample_weights)
-                score_ab = smoothed_dipscore_at(
-                    0.0, unique_dbad, weights, dipscore_only=True
+                tmp_dense = np.nan_to_num(
+                    tmp_dense, nan=self.match_threshold, posinf=self.match_threshold, copy=False
                 )
+                bad_a, bad_b = tmp_dense
+                if self.bimodality_kind in ("isotonic", "truncnorm"):
+                    dbad = bad_a - bad_b
+                    unique_dbad, inverse = np.unique(dbad, return_inverse=True)
+                    weights = np.zeros(unique_dbad.shape)
+                    np.add.at(weights, inverse, sample_weights)
+                    score_ab = smoothed_dipscore_at(
+                        0.0, unique_dbad, sample_weights=weights, dipscore_only=True, kind=self.bimodality_kind
+                    )
+                elif self.bimodality_kind == "pearson":
+                    res = pearsonr(bad_a, bad_b)
+                    score_ab = 1.0 - np.abs(res.statistic)
+                else:
+                    assert False
                 scores[i, j] = scores[j, i] = score_ab
+
+        pool = joblib.Parallel(max(1, n_threads), backend="threading", return_as="generator")
+        jobs = pool(unit_bimodality_job(i, ua) for i, ua in enumerate(unit_ids))
+        for res in tqdm(jobs, desc="Bimodality"):
+            pass
 
         return scores
 
-    def merge(self, n_threads=0):
-        merge_dists = self.central_divergences(
-            kind=self.merge_metric,
-            # min_overlap=self.min_overlap,
-            n_threads=n_threads,
+    def bimodalities_prefit(
+        self,
+        units,
+        which_spikes,
+        n_threads=0,
+        impute_missing=True,
+        common_chans=False,
+        return_dbad=False,
+    ):
+        divergences = self.reassignment_divergences(
+            which_spikes=which_spikes,
+            units=units,
+            show_progress=False,
+            impute_missing=impute_missing,
+            common_chans=common_chans,
         )
-        merge_dists = self.merge_sym_function(merge_dists, merge_dists.T)
-        merge_dists = merge_dists.numpy(force=True)
+        nu = len(units)
+        divergences_ = np.full(divergences.shape, np.inf)
+        divergences_[divergences.coords] = divergences.data
+        divergences = divergences_
+        scores = np.zeros((nu, nu))
+        if return_dbad:
+            dbads = []
+            # for i in range(nu):
+            #     dbads.append(np.nan_to_num(divergences[i]))
+            dbads = divergences
+        for i in range(nu):
+            for j in range(i + 1, nu):
+                badness = divergences[[i, j]]
+                tmp_dense = np.nan_to_num(badness, nan=self.match_threshold, posinf=self.match_threshold, copy=False)
+                bad_a, bad_b = tmp_dense
+                if self.bimodality_kind in ("isotonic", "truncnorm"):
+                    dbad = bad_a - bad_b
+                    # if return_dbad:
+                    #     dbads.append(dbad)
+                    unique_dbad, inverse = np.unique(dbad, return_inverse=True)
+    
+                    score_ab = smoothed_dipscore_at(
+                        0.0, unique_dbad, sample_weights=None, dipscore_only=True, kind=self.bimodality_kind
+                    )
+                elif self.bimodality_kind == "pearson":
+                    res = pearsonr(bad_a, bad_b)
+                    score_ab = np.abs(res.statistic)
+                else:
+                    assert False
+                scores[i, j] = scores[j, i] = score_ab
+        if return_dbad:
+            return dbads, scores
+        return scores
 
-        if self.merge_with_bimodality:
-            to_check = np.isfinite(merge_dists)
-            bimodalities = self.unit_bimodalities(compute_mask=to_check)
+    def merge(self, merge_dists=None, n_threads=0, threshold=None, allow_bimodality=True, metric=None, common_chans=False):
+        if threshold is None:
+            threshold = self.merge_threshold
+        if metric is None:
+            metric = self.merge_metric
+        if merge_dists is None:
+            merge_dists = self.central_divergences(
+                kind=metric,
+                # min_overlap=self.min_overlap,
+                n_threads=n_threads,
+                common_chans=common_chans,
+            )
+            merge_dists = self.merge_sym_function(merge_dists, merge_dists.T)
+            merge_dists = merge_dists.numpy(force=True)
+
+        if allow_bimodality and self.merge_with_bimodality:
+            to_check = np.logical_and(
+                np.isfinite(merge_dists),
+                merge_dists <= threshold,
+            )
+            bimodalities = self.unit_bimodalities(compute_mask=to_check, n_threads=n_threads, common_chans=common_chans)
             # change bimodality so that thresholds match
-            bimodalities *= self.merge_threshold / self.bimodality_threshold
+            bimodalities *= threshold / self.bimodality_threshold
             merge_dists = np.maximum(bimodalities, merge_dists)
 
         valid = np.isfinite(merge_dists)
         merge_dists[np.logical_not(valid)] = merge_dists[valid].max() + 10
         d = merge_dists[np.triu_indices(merge_dists.shape[0], k=1)]
         Z = linkage(d, method=self.merge_linkage)
-        new_labels = fcluster(Z, self.merge_threshold, criterion="distance")
+        new_labels = fcluster(Z, threshold, criterion="distance")
         new_labels -= 1
         unique_new_labels = np.unique(new_labels)
         print(f"Merge: {merge_dists.shape[0]} -> {unique_new_labels.size}")
@@ -2437,7 +2669,6 @@ class InterpClusterer(torch.nn.Module):
             self.unit_ids(),
             torch.from_numpy(new_labels).to(self.labels),
         )
-        self.order_by_depth()
 
     def all_reassignment_divergences(
         self,
@@ -2532,6 +2763,8 @@ class InterpClusterer(torch.nn.Module):
         exclude_above=None,
         kind=None,
         single=False,
+        impute_missing=False,
+        common_chans=False,
     ):
         if unit_ids is None and units is None:
             unit_ids = self.unit_ids()
@@ -2561,23 +2794,33 @@ class InterpClusterer(torch.nn.Module):
         static_chans = self.data.reassign_static_channels[which_spikes]
         if n_threads == 0:
             for j, unit in enumerate(units):
-                overlaps, rel_ix = unit.overlaps(static_chans)
-                (which,) = torch.nonzero(overlaps >= self.min_overlap, as_tuple=True)
-                if not which.numel():
-                    continue
-                overlaps = overlaps[which]
-                rel_ix = rel_ix[which]
-                batch_indices = which = which.numpy(force=True)
-                if subsampling:
-                    batch_indices = which_spikes[which]
+                if not impute_missing:
+                    overlaps, rel_ix = unit.overlaps(static_chans)
+                    (which,) = torch.nonzero(overlaps >= self.min_overlap, as_tuple=True)
+                    if not which.numel():
+                        continue
+                    overlaps = overlaps[which]
+                    rel_ix = rel_ix[which]
+                    batch_indices = which = which.numpy(force=True)
+                    if subsampling:
+                        batch_indices = which_spikes[which]
+                else:
+                    if subsampling:
+                        batch_indices = which_spikes
+                        which = np.arange(len(which_spikes))
+                    else:
+                        batch_indices = which = np.arange(len(static_chans))
 
                 results = np.zeros(which.shape, dtype=dtype)
                 for sl, batch in self.batches(batch_indices, waveform_kind="reassign"):
+                    slkw = {} if impute_missing else dict(overlaps=overlaps[sl], rel_ix=rel_ix[sl])
                     _, _, res = unit.spike_badnesses(
                         **batch,
-                        overlaps=overlaps[sl],
-                        rel_ix=rel_ix[sl],
+                        **slkw,
                         kinds=(kind,),
+                        impute_missing=impute_missing,
+                        padded_geom=self.data.padded_registered_geom,
+                        common_chans=common_chans,
                     )
                     results[sl] = res[kind].numpy(force=True)
                     # divergences[j, which[sl]] = res[kind].numpy(force=True)
@@ -2590,6 +2833,7 @@ class InterpClusterer(torch.nn.Module):
                 ii.append(np.broadcast_to(np.array([j]), jj[-1].shape))
                 values.append(results[keep])
         else:
+            assert not impute_missing
             import joblib
 
             def reas_job(j, unit):
@@ -2612,6 +2856,8 @@ class InterpClusterer(torch.nn.Module):
                         overlaps=overlaps[sl],
                         rel_ix=rel_ix[sl],
                         kinds=(self.reassign_metric,),
+                        impute_missing=impute_missing,
+                        padded_geom=self.data.padded_registered_geom,
                     )
                     rrr.append((sl, res[self.reassign_metric]))
                 for sl, res in rrr:
@@ -2662,58 +2908,96 @@ class InterpClusterer(torch.nn.Module):
 
     def reassignment_weights(
         self,
-        which_spikes=None,
         unit_ids=None,
         units=None,
         show_progress=True,
         n_threads=0,
         exclude_above=None,
         kind=None,
-        single=False,
         divergences=None,
         max_weight=1e2,
+        sampling_method=None,
     ):
         div_kind = kind
         if kind == "recipr2":
             div_kind = "1-r^2"
             kind = "recip"
+        if units is None and unit_ids is None:
+            unit_ids = self.unit_ids()
+        elif units is not None:
+            assert unit_ids is not None
+
+        # pick spikes to get weights for
+        # which means picking the spikes we'll use to fit the models
+        unit_indices = [self.get_indices(uid, sampling_method=sampling_method) for uid in unit_ids]
+        index_labels = [torch.full_like(ix, uid) for ix, uid in zip(unit_indices, unit_ids)]
+        all_indices = torch.cat(unit_indices)
+        index_labels = torch.cat(index_labels)
+        order = torch.argsort(all_indices, stable=True)
+        index_labels = index_labels[order]
+        all_indices = all_indices[order]
+
         if divergences is None:
             divergences = self.reassignment_divergences(
-                which_spikes=which_spikes,
+                which_spikes=all_indices,
                 unit_ids=unit_ids,
                 units=units,
                 show_progress=show_progress,
                 n_threads=n_threads,
                 exclude_above=exclude_above,
                 kind=div_kind,
-                single=single,
             )
+            coo = torch.from_numpy(divergences.coords[0]), torch.from_numpy(
+                divergences.coords[1]
+            )
+            coo = torch.row_stack(coo)
+            weights = torch.sparse_coo_tensor(
+                coo,
+                torch.from_numpy(divergences.data).to(torch.float),
+                size=divergences.shape,
+            )
+        else:
+            coo = torch.from_numpy(divergences.coords[0]), torch.from_numpy(
+                divergences.coords[1]
+            )
+            coo = torch.row_stack(coo)
+            weights = torch.sparse_coo_tensor(
+                coo,
+                torch.from_numpy(divergences.data).to(torch.float),
+                size=divergences.shape,
+            )
+            weights = torch.index_select(weights, 1, all_indices)
+        assert weights.shape == (len(unit_ids), all_indices.numel())
+        weights = weights.to(self.device).coalesce()
+        index_labels = index_labels.to(self.device)
 
         if "recip" in kind:
-            divergences.data.clip(min=1.0 / max_weight, out=divergences.data)
-            np.reciprocal(divergences.data, out=divergences.data)
-
-        # convert to torch sparse so we can do a softmax
-        coo = torch.from_numpy(divergences.coords[0]), torch.from_numpy(
-            divergences.coords[1]
-        )
-        coo = torch.row_stack(coo)
-        weights = torch.sparse_coo_tensor(
-            coo,
-            torch.from_numpy(divergences.data).to(torch.float),
-            size=divergences.shape,
-        )
-        weights = weights.to(self.device)
+            weights.values().clamp_(min=1.0 / max_weight).reciprocal_()
 
         if kind in ("l2", "scaledl2"):
             weights = torch.sparse.softmax(-0.5 * weights, dim=0)
+        elif "nll" in kind:
+            # weights are negative log likes
+            # get responsibilities, which are softmax of log liks
+            weights = torch.sparse.softmax(-weights, dim=0)
+            # weights.data.neg_()
         elif kind == "1-r^2":
             weights = torch.sparse.softmax(-5 * weights, dim=0)
         elif kind == "recip":
             pass
         else:
             assert False
-        return weights
+
+        # convert to dict for caller
+        # note: unit_indices[i] was already sorted, and order was done stably, so
+        # all_indices[index_labels == i] is the same as unit_indices[i]
+        weights_info = {}
+        for j, (uid, my_inds) in enumerate(zip(unit_ids, unit_indices)):
+            (inu,) = torch.nonzero(index_labels == uid, as_tuple=True)
+            my_weights = torch.index_select(weights[j], 0, inu).to_dense()
+            weights_info[uid] = (my_inds, my_weights)
+
+        return weights_info
 
     def reassign(
         self, n_threads=0, show_progress=True, verbose=True, return_divergences=False, drop_dups=False
@@ -3475,6 +3759,7 @@ def _load_data(
     drift_positions="channel",
     kriging_sigma="pitch",
     rg=0,
+    n_samples_var=8192,
 ):
     rg = np.random.default_rng(rg)
 
@@ -3663,6 +3948,23 @@ def _load_data(
         pipeline = torch.load(pipeline_pt)
         tpca = pipeline.transformers[0]
 
+    # learn a variance per rank based on max channel waveforms
+    var_fit_ix = rg.choice(n_spikes, size=n_samples_var, replace=False)
+    var_fit_ix.sort()
+    # var_fit_ix = torch.from_numpy(var_fit_ix).to(channels)
+    single_channel_index = np.arange(len(reassign_channel_index))[:, None]#.to(reassign_channel_index)
+    wfs_var = waveform_util.channel_subset_by_index(
+        original_tpca_embeds[var_fit_ix],
+        channels[var_fit_ix],
+        original_channel_index,
+        single_channel_index,
+        chunk_length=256,
+    )
+    assert wfs_var.shape[2] == 1
+    assert np.isfinite(wfs_var).all()
+    global_var = np.nanvar(wfs_var[:, :, 0], axis=0)
+    global_ptp = np.ptp(wfs_var[:, :, 0], axis=0)
+
     return SpikeData(
         keepers=keepers,
         spike_train=sorting,
@@ -3695,6 +3997,8 @@ def _load_data(
         tpca=tpca,
         geom=geom,
         kriging_sigma=kriging_sigma,
+        global_var=global_var,
+        global_ptp=global_ptp,
     )
 
 
@@ -4095,11 +4399,20 @@ def kernel_interpolate(
     kind="normalized",
     out=None,
 ):
+    # print(f"{source_pos=}")
+    # print(f"{target_pos=}")
+
     # geoms should be nan-padded here.
     # build kernel
     kernel = log_rbf(source_pos, target_pos, sigma)
+    # print(f"{features.shape=} {source_pos.shape=} {target_pos.shape=} {kernel.shape=}")
+    # print(f"0 {kernel=}")
     if kind == "normalized":
         kernel = F.softmax(kernel, dim=1)
+        # print(f"1 {kernel=}")
+        # print(f"{kernel.sum(0)=}")
+        # print(f"{kernel.sum(1)=}")
+        # print(f"{kernel.sum(2)=}")
     elif kind.startswith("kriging"):
         kernel = kernel.exp_()
         kernel = source_kernel_invs @ kernel
@@ -4110,6 +4423,8 @@ def kernel_interpolate(
     else:
         assert False
     torch.nan_to_num(kernel, out=kernel)
+    # print(f"2 {kernel=}")
+    # print(f"{features=}")
 
     # and apply...
     features = torch.nan_to_num(features, out=features if allow_destroy else None)
@@ -4123,6 +4438,8 @@ def kernel_interpolate(
     needs_nan = torch.isnan(target_pos).all(2).unsqueeze(1)
     needs_nan = needs_nan.broadcast_to(features.shape)
     features[needs_nan] = torch.nan
+    # print(f"{features=}")
+    # barf
 
     return features
 
